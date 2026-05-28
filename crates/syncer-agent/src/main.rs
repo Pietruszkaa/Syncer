@@ -7,8 +7,8 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use syncer_core::{
-    FolderMode, FolderSizeLimit, FolderStore, LinuxFolderScanner, PendingTransfer, RelativePath,
-    StateDatabase,
+    DEFAULT_FOLDER_SIZE_LIMIT_BYTES, FolderMode, FolderSizeLimit, FolderStore, LinuxFolderScanner,
+    PendingTransfer, RelativePath, StateDatabase,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -35,7 +35,7 @@ enum Command {
         path: Utf8PathBuf,
         #[arg(long)]
         display_name: String,
-        #[arg(long)]
+        #[arg(long, default_value_t = DEFAULT_FOLDER_SIZE_LIMIT_BYTES)]
         max_bytes: u64,
         #[arg(long, default_value_t = 80)]
         warning_threshold_percent: u8,
@@ -45,6 +45,10 @@ enum Command {
         path: Utf8PathBuf,
         #[arg(long, default_value = ".syncer-local/device.json")]
         device_config: Utf8PathBuf,
+    },
+    FolderStatus {
+        #[arg(long)]
+        path: Utf8PathBuf,
     },
     PlanFolderLimit {
         #[arg(long)]
@@ -110,6 +114,7 @@ async fn main() -> Result<(), AgentError> {
             path,
             device_config,
         } => scan_folder(path, device_config).await,
+        Command::FolderStatus { path } => folder_status(path).await,
         Command::PlanFolderLimit {
             max_bytes,
             warning_threshold_percent,
@@ -148,6 +153,14 @@ async fn scan_folder(path: Utf8PathBuf, device_config: Utf8PathBuf) -> Result<()
     let summary = scanner.scan_into(&database).await?;
 
     print_json(&summary)
+}
+
+async fn folder_status(path: Utf8PathBuf) -> Result<(), AgentError> {
+    let store = FolderStore::new(path);
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    let status = database.folder_status().await?;
+
+    print_json(&status)
 }
 
 fn init_device(name: String, config: Utf8PathBuf) -> Result<(), AgentError> {

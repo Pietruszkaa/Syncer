@@ -1,0 +1,25 @@
+/target/
+/node_modules/
+/dist/
+/.idea/
+/.vscode/
+*.iml
+*.log
+.DS_Store
+
+# Local Syncer runtime state.
+.syncer-local/
+**/.syncer/
+*.local.json
+
+# Local manual test data.
+/test_folders/
+
+# Android build output.
+apps/android/.gradle/
+apps/android/build/
+apps/android/**/build/
+
+# Tauri build output.
+apps/linux-tauri/src-tauri/target/
+apps/linux-tauri/dist/

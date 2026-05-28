@@ -5,6 +5,8 @@ use crate::error::{CoreError, CoreResult};
 use crate::ids::OperationId;
 use crate::manifest::RelativePath;
 
+pub const DEFAULT_FOLDER_SIZE_LIMIT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FolderSizeLimit {
     pub max_bytes: u64,
@@ -45,6 +47,15 @@ impl FolderSizeLimit {
             .saturating_mul(u64::from(self.warning_threshold_percent))
             / 100;
         used_bytes >= threshold
+    }
+}
+
+impl Default for FolderSizeLimit {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_FOLDER_SIZE_LIMIT_BYTES,
+            warning_threshold_percent: 80,
+        }
     }
 }
 

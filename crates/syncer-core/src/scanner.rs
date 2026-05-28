@@ -142,6 +142,7 @@ impl LinuxFolderScanner {
             }
         }
 
+        database.finalize_scan().await?;
         summary.local_missing = database.list_missing_after_scan().await?.len() as u64;
         Ok(summary)
     }
@@ -185,6 +186,25 @@ mod tests {
         assert_eq!(summary.files_seen, 1);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path.as_path().as_str(), "file.txt");
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scanner_marks_removed_files_as_local_missing() -> Result<(), crate::CoreError> {
+        let root =
+            std::env::temp_dir().join(format!("syncer-scan-missing-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("file.txt"), b"hello")?;
+
+        let database = StateDatabase::in_memory().await?;
+        let scanner = LinuxFolderScanner::from_std_path(&root, DeviceId::new())?;
+        scanner.scan_into(&database).await?;
+
+        fs::remove_file(root.join("file.txt"))?;
+        let summary = scanner.scan_into(&database).await?;
+
+        assert_eq!(summary.local_missing, 1);
         fs::remove_dir_all(root).ok();
         Ok(())
     }
