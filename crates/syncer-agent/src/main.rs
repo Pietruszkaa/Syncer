@@ -1,3 +1,4 @@
+mod path_codec;
 mod peer_client;
 mod peer_server;
 mod peer_store;
@@ -11,9 +12,9 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use syncer_core::{
-    DEFAULT_FOLDER_SIZE_LIMIT_BYTES, FolderManifest, FolderMode, FolderSizeLimit, FolderStore,
-    LinuxFolderScanner, PeerPresence, PendingTransfer, RelativePath, StateDatabase,
-    plan_manifest_sync,
+    ContentHash, DEFAULT_FOLDER_SIZE_LIMIT_BYTES, FileEntry, FileKind, FileVersion, FolderManifest,
+    FolderMode, FolderSizeLimit, FolderStore, LinuxFolderScanner, PeerPresence, PendingTransfer,
+    RelativePath, StateDatabase, SyncOperationRecord, plan_manifest_sync,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -115,6 +116,32 @@ enum Command {
         #[arg(long, default_value = ".syncer-local/device.json")]
         device_config: Utf8PathBuf,
     },
+    EnqueueSyncPlan {
+        #[arg(long)]
+        path: Utf8PathBuf,
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        shared_secret: String,
+        #[arg(long, default_value = ".syncer-local/device.json")]
+        device_config: Utf8PathBuf,
+    },
+    QueueStatus {
+        #[arg(long)]
+        path: Utf8PathBuf,
+    },
+    ExecuteSyncQueue {
+        #[arg(long)]
+        path: Utf8PathBuf,
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        shared_secret: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        #[arg(long, default_value = ".syncer-local/device.json")]
+        device_config: Utf8PathBuf,
+    },
     PlanFolderLimit {
         #[arg(long)]
         max_bytes: u64,
@@ -167,6 +194,8 @@ enum AgentError {
     PeerClient(#[from] peer_client::PeerClientError),
     #[error("{0}")]
     PeerStore(#[from] peer_store::PeerStoreError),
+    #[error("{0}")]
+    Transfer(#[from] TransferError),
 }
 
 #[tokio::main]
@@ -219,6 +248,20 @@ async fn main() -> Result<(), AgentError> {
             shared_secret,
             device_config,
         } => plan_sync(path, &endpoint, &shared_secret, &device_config).await,
+        Command::EnqueueSyncPlan {
+            path,
+            endpoint,
+            shared_secret,
+            device_config,
+        } => enqueue_sync_plan(path, &endpoint, &shared_secret, &device_config).await,
+        Command::QueueStatus { path } => queue_status(path).await,
+        Command::ExecuteSyncQueue {
+            path,
+            endpoint,
+            shared_secret,
+            limit,
+            device_config,
+        } => execute_sync_queue(path, &endpoint, &shared_secret, limit, &device_config).await,
         Command::PlanFolderLimit {
             max_bytes,
             warning_threshold_percent,
@@ -366,6 +409,99 @@ async fn plan_sync(
     shared_secret: &str,
     device_config: &Utf8PathBuf,
 ) -> Result<(), AgentError> {
+    let (plan, _) = build_sync_plan(path, endpoint, shared_secret, device_config).await?;
+
+    print_json(&plan)
+}
+
+async fn enqueue_sync_plan(
+    path: Utf8PathBuf,
+    endpoint: &str,
+    shared_secret: &str,
+    device_config: &Utf8PathBuf,
+) -> Result<(), AgentError> {
+    let (plan, database) = build_sync_plan(path, endpoint, shared_secret, device_config).await?;
+    let status = database.enqueue_sync_plan(&plan).await?;
+
+    print_json(&EnqueueSyncPlanOutput {
+        queued: status,
+        plan_summary: plan.summary,
+    })
+}
+
+async fn queue_status(path: Utf8PathBuf) -> Result<(), AgentError> {
+    let store = FolderStore::new(path);
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    let status = database.queue_status().await?;
+    let operations = database.list_sync_operations().await?;
+
+    print_json(&QueueStatusOutput { status, operations })
+}
+
+async fn execute_sync_queue(
+    path: Utf8PathBuf,
+    endpoint: &str,
+    shared_secret: &str,
+    limit: u64,
+    device_config: &Utf8PathBuf,
+) -> Result<(), AgentError> {
+    let profile = LocalDeviceProfile::read(device_config)?;
+    let store = FolderStore::new(path);
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    let remote_manifest =
+        peer_client::fetch_manifest(endpoint, &profile.device_id.to_string(), shared_secret)?;
+    let operations = database
+        .list_pending_download_operations(&remote_manifest.device_id.to_string(), limit)
+        .await?;
+    let mut results = Vec::with_capacity(operations.len());
+    let mut completed = 0_u64;
+    let mut failed = 0_u64;
+
+    for operation in operations {
+        match download_operation(
+            &store,
+            &database,
+            &profile,
+            endpoint,
+            shared_secret,
+            &remote_manifest,
+            &operation,
+        )
+        .await
+        {
+            Ok(result) => {
+                completed = completed.saturating_add(1);
+                results.push(result);
+            }
+            Err(error) => {
+                failed = failed.saturating_add(1);
+                database
+                    .mark_sync_operation_failed(&operation.id, &error.to_string())
+                    .await?;
+                results.push(TransferOperationResult {
+                    operation_id: operation.id,
+                    path: operation.path,
+                    status: "failed",
+                    size_bytes: operation.remote_size_bytes.unwrap_or_default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+
+    print_json(&ExecuteSyncQueueOutput {
+        completed,
+        failed,
+        results,
+    })
+}
+
+async fn build_sync_plan(
+    path: Utf8PathBuf,
+    endpoint: &str,
+    shared_secret: &str,
+    device_config: &Utf8PathBuf,
+) -> Result<(syncer_core::SyncPlan, StateDatabase), AgentError> {
     let profile = LocalDeviceProfile::read(device_config)?;
     let store = FolderStore::new(path.clone());
     let database = StateDatabase::open(&store.state_db_path()).await?;
@@ -377,7 +513,136 @@ async fn plan_sync(
         peer_client::fetch_manifest(endpoint, &profile.device_id.to_string(), shared_secret)?;
     let plan = plan_manifest_sync(&local_manifest, &remote_manifest);
 
-    print_json(&plan)
+    Ok((plan, database))
+}
+
+async fn download_operation(
+    store: &FolderStore,
+    database: &StateDatabase,
+    profile: &LocalDeviceProfile,
+    endpoint: &str,
+    shared_secret: &str,
+    remote_manifest: &FolderManifest,
+    operation: &SyncOperationRecord,
+) -> Result<TransferOperationResult, TransferError> {
+    let remote_file = remote_manifest
+        .files
+        .iter()
+        .find(|file| file.path == operation.path)
+        .ok_or(TransferError::RemoteFileMissing)?;
+    if remote_file.kind != FileKind::File {
+        return Err(TransferError::RemotePathIsNotFile);
+    }
+    let expected_hash = operation
+        .remote_content_hash
+        .as_deref()
+        .or(remote_file.content_hash.as_deref())
+        .ok_or(TransferError::RemoteHashMissing)?;
+    if remote_file.content_hash.as_deref() != Some(expected_hash) {
+        return Err(TransferError::RemoteFileChanged);
+    }
+    if operation
+        .remote_size_bytes
+        .is_some_and(|size_bytes| size_bytes != remote_file.size_bytes)
+    {
+        return Err(TransferError::RemoteFileChanged);
+    }
+
+    let target = store.root().join(operation.path.as_path());
+    if tokio::fs::try_exists(&target)
+        .await
+        .map_err(|source| TransferError::Filesystem {
+            path: target.clone(),
+            source,
+        })?
+    {
+        return Err(TransferError::LocalTargetExists);
+    }
+
+    let bytes = peer_client::fetch_file(
+        endpoint,
+        &profile.device_id.to_string(),
+        shared_secret,
+        &operation.path,
+        remote_file.size_bytes,
+    )?;
+    let downloaded_size =
+        u64::try_from(bytes.len()).map_err(|_| TransferError::FileSizeOverflow)?;
+    if downloaded_size != remote_file.size_bytes {
+        return Err(TransferError::SizeMismatch {
+            expected: remote_file.size_bytes,
+            actual: downloaded_size,
+        });
+    }
+    let content_hash = ContentHash::from_bytes(&bytes);
+    if content_hash.as_hex() != expected_hash {
+        return Err(TransferError::HashMismatch);
+    }
+
+    publish_download(store, &operation.id, &operation.path, &bytes).await?;
+    database
+        .upsert_file(&FileEntry {
+            path: operation.path.clone(),
+            kind: FileKind::File,
+            size_bytes: downloaded_size,
+            modified_at: OffsetDateTime::now_utc(),
+            content_hash: Some(content_hash),
+            block_hashes: Vec::new(),
+            version: FileVersion {
+                generation: remote_file.generation,
+                device_id: profile.device_id,
+            },
+        })
+        .await?;
+    database.mark_sync_operation_done(&operation.id).await?;
+
+    Ok(TransferOperationResult {
+        operation_id: operation.id.clone(),
+        path: operation.path.clone(),
+        status: "done",
+        size_bytes: downloaded_size,
+        error: None,
+    })
+}
+
+async fn publish_download(
+    store: &FolderStore,
+    operation_id: &str,
+    relative_path: &RelativePath,
+    bytes: &[u8],
+) -> Result<(), TransferError> {
+    let temporary_dir = store.syncer_dir().join("tmp").join("downloads");
+    tokio::fs::create_dir_all(&temporary_dir)
+        .await
+        .map_err(|source| TransferError::Filesystem {
+            path: temporary_dir.clone(),
+            source,
+        })?;
+    let temporary = temporary_dir.join(format!("{operation_id}.part"));
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(|source| TransferError::Filesystem {
+            path: temporary.clone(),
+            source,
+        })?;
+
+    let target = store.root().join(relative_path.as_path());
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| TransferError::Filesystem {
+                path: parent.to_owned(),
+                source,
+            })?;
+    }
+    tokio::fs::rename(&temporary, &target)
+        .await
+        .map_err(|source| TransferError::Filesystem {
+            path: target,
+            source,
+        })?;
+
+    Ok(())
 }
 
 async fn load_manifest(
@@ -549,4 +814,61 @@ struct AcceptPeerOutput {
     device_id: String,
     device_name: String,
     peers_path: Utf8PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct EnqueueSyncPlanOutput {
+    queued: syncer_core::QueueStatus,
+    plan_summary: syncer_core::SyncPlanSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueStatusOutput {
+    status: syncer_core::QueueStatus,
+    operations: Vec<syncer_core::SyncOperationRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecuteSyncQueueOutput {
+    completed: u64,
+    failed: u64,
+    results: Vec<TransferOperationResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct TransferOperationResult {
+    operation_id: String,
+    path: RelativePath,
+    status: &'static str,
+    size_bytes: u64,
+    error: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum TransferError {
+    #[error("remote file is missing")]
+    RemoteFileMissing,
+    #[error("remote path is not a regular file")]
+    RemotePathIsNotFile,
+    #[error("remote file hash is missing")]
+    RemoteHashMissing,
+    #[error("remote file changed after this operation was queued")]
+    RemoteFileChanged,
+    #[error("local target already exists")]
+    LocalTargetExists,
+    #[error("downloaded size mismatch: expected {expected}, got {actual}")]
+    SizeMismatch { expected: u64, actual: u64 },
+    #[error("downloaded file hash does not match remote manifest")]
+    HashMismatch,
+    #[error("file size exceeded supported range")]
+    FileSizeOverflow,
+    #[error("filesystem error at {path}: {source}")]
+    Filesystem {
+        path: Utf8PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{0}")]
+    PeerClient(#[from] peer_client::PeerClientError),
+    #[error("{0}")]
+    Core(#[from] syncer_core::CoreError),
 }

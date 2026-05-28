@@ -72,6 +72,8 @@ pub struct SyncPlanEntry {
     pub action: SyncAction,
     pub local_size_bytes: Option<u64>,
     pub remote_size_bytes: Option<u64>,
+    pub local_content_hash: Option<String>,
+    pub remote_content_hash: Option<String>,
     pub reason: String,
 }
 
@@ -145,6 +147,8 @@ fn plan_path(
                     SyncAction::LocalMissingUnsynchronized,
                     Some(local.size_bytes),
                     None,
+                    local.content_hash.clone(),
+                    None,
                     "local side is missing a previously known file",
                 )
             } else {
@@ -152,6 +156,8 @@ fn plan_path(
                     path,
                     SyncAction::UploadToRemote,
                     Some(local.size_bytes),
+                    None,
+                    local.content_hash.clone(),
                     None,
                     "remote side does not have this file",
                 )
@@ -164,6 +170,8 @@ fn plan_path(
                     SyncAction::RemoteMissingUnsynchronized,
                     None,
                     Some(remote.size_bytes),
+                    None,
+                    remote.content_hash.clone(),
                     "remote side is missing a previously known file",
                 )
             } else {
@@ -172,6 +180,8 @@ fn plan_path(
                     SyncAction::DownloadFromRemote,
                     None,
                     Some(remote.size_bytes),
+                    None,
+                    remote.content_hash.clone(),
                     "local side does not have this file",
                 )
             }
@@ -179,6 +189,8 @@ fn plan_path(
         (None, None) => entry(
             path,
             SyncAction::InSync,
+            None,
+            None,
             None,
             None,
             "file absent on both sides",
@@ -193,6 +205,8 @@ fn plan_existing_path(path: &str, local: &FileRecord, remote: &FileRecord) -> Sy
             SyncAction::LocalMissingUnsynchronized,
             Some(local.size_bytes),
             Some(remote.size_bytes),
+            local.content_hash.clone(),
+            remote.content_hash.clone(),
             "local side is missing a previously known file",
         );
     }
@@ -202,6 +216,8 @@ fn plan_existing_path(path: &str, local: &FileRecord, remote: &FileRecord) -> Sy
             SyncAction::RemoteMissingUnsynchronized,
             Some(local.size_bytes),
             Some(remote.size_bytes),
+            local.content_hash.clone(),
+            remote.content_hash.clone(),
             "remote side is missing a previously known file",
         );
     }
@@ -211,6 +227,8 @@ fn plan_existing_path(path: &str, local: &FileRecord, remote: &FileRecord) -> Sy
             SyncAction::InSync,
             Some(local.size_bytes),
             Some(remote.size_bytes),
+            local.content_hash.clone(),
+            remote.content_hash.clone(),
             "content hash and size match",
         );
     }
@@ -220,6 +238,8 @@ fn plan_existing_path(path: &str, local: &FileRecord, remote: &FileRecord) -> Sy
         SyncAction::Conflict,
         Some(local.size_bytes),
         Some(remote.size_bytes),
+        local.content_hash.clone(),
+        remote.content_hash.clone(),
         "both sides have different content and no common base version is known",
     )
 }
@@ -229,6 +249,8 @@ fn entry(
     action: SyncAction,
     local_size_bytes: Option<u64>,
     remote_size_bytes: Option<u64>,
+    local_content_hash: Option<String>,
+    remote_content_hash: Option<String>,
     reason: &str,
 ) -> SyncPlanEntry {
     SyncPlanEntry {
@@ -236,6 +258,8 @@ fn entry(
         action,
         local_size_bytes,
         remote_size_bytes,
+        local_content_hash,
+        remote_content_hash,
         reason: reason.to_owned(),
     }
 }

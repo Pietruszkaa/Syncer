@@ -4,13 +4,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use syncer_core::{FolderManifest, PeerPresence};
+use syncer_core::{FolderManifest, PeerPresence, RelativePath};
 use time::OffsetDateTime;
 
+use crate::path_codec::encode_relative_path;
 use crate::peer_server::PresenceResponse;
 use crate::request_signing::sign_request;
 
 const RESPONSE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const RESPONSE_HEADER_LIMIT_BYTES: u64 = 16 * 1024;
 
 pub fn post_presence(
     endpoint: &str,
@@ -43,6 +45,26 @@ pub fn fetch_manifest(
     )
 }
 
+pub fn fetch_file(
+    endpoint: &str,
+    device_id: &str,
+    shared_secret_hex: &str,
+    path: &RelativePath,
+    size_bytes: u64,
+) -> Result<Vec<u8>, PeerClientError> {
+    let request_path = format!("/file/{}", encode_relative_path(path));
+    request_bytes(
+        "GET",
+        endpoint,
+        &request_path,
+        device_id,
+        shared_secret_hex,
+        &[],
+        size_bytes.saturating_add(RESPONSE_HEADER_LIMIT_BYTES),
+    )
+    .and_then(|response| parse_bytes_response(&response))
+}
+
 fn request_json<T: Serialize, R: DeserializeOwned>(
     method: &str,
     endpoint: &str,
@@ -51,13 +73,35 @@ fn request_json<T: Serialize, R: DeserializeOwned>(
     shared_secret_hex: &str,
     body: Option<&T>,
 ) -> Result<R, PeerClientError> {
-    let address = PeerAddress::parse(endpoint)?;
     let body = match body {
         Some(value) => serde_json::to_vec(value)?,
         None => Vec::new(),
     };
+    let response = request_bytes(
+        method,
+        endpoint,
+        path,
+        device_id,
+        shared_secret_hex,
+        &body,
+        RESPONSE_LIMIT_BYTES as u64,
+    )?;
+
+    parse_json_response(&response)
+}
+
+fn request_bytes(
+    method: &str,
+    endpoint: &str,
+    path: &str,
+    device_id: &str,
+    shared_secret_hex: &str,
+    body: &[u8],
+    response_limit_bytes: u64,
+) -> Result<Vec<u8>, PeerClientError> {
+    let address = PeerAddress::parse(endpoint)?;
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
-    let signature = sign_request(method, path, device_id, timestamp, &body, shared_secret_hex)?;
+    let signature = sign_request(method, path, device_id, timestamp, body, shared_secret_hex)?;
     let request = format!(
         "{method} {path} HTTP/1.1\r\nhost: {}\r\nx-syncer-device-id: {device_id}\r\nx-syncer-timestamp: {timestamp}\r\nx-syncer-signature: {signature}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         address.host,
@@ -68,13 +112,13 @@ fn request_json<T: Serialize, R: DeserializeOwned>(
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
+    stream.write_all(body)?;
 
     let mut response = Vec::new();
     stream
-        .take(RESPONSE_LIMIT_BYTES as u64)
+        .take(response_limit_bytes)
         .read_to_end(&mut response)?;
-    parse_json_response(&response)
+    Ok(response)
 }
 
 fn parse_json_response<R: DeserializeOwned>(response: &[u8]) -> Result<R, PeerClientError> {
@@ -100,6 +144,30 @@ fn parse_json_response<R: DeserializeOwned>(response: &[u8]) -> Result<R, PeerCl
     }
 
     serde_json::from_slice(body).map_err(PeerClientError::Json)
+}
+
+fn parse_bytes_response(response: &[u8]) -> Result<Vec<u8>, PeerClientError> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or(PeerClientError::InvalidResponse)?;
+    let status_line = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| PeerClientError::InvalidResponse)?
+        .lines()
+        .next()
+        .ok_or(PeerClientError::InvalidResponse)?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or(PeerClientError::InvalidResponse)?
+        .parse::<u16>()
+        .map_err(|_| PeerClientError::InvalidResponse)?;
+
+    if status != 200 {
+        return Err(PeerClientError::HttpStatus(status));
+    }
+
+    Ok(response[header_end + 4..].to_vec())
 }
 
 #[derive(Debug)]

@@ -28,6 +28,6 @@ pub use planning::{
 pub use scanner::{LinuxFolderScanner, ScanSummary};
 pub use security::{PairingTicket, PeerPresence, PublicKeyBytes};
 pub use state_db::{
-    FileRecord, FileSyncState, FolderManifest, FolderStatus, SkippedFileRecord, SkippedReason,
-    StateDatabase,
+    FileRecord, FileSyncState, FolderManifest, FolderStatus, QueueStatus, SkippedFileRecord,
+    SkippedReason, StateDatabase, SyncOperationKind, SyncOperationRecord, SyncOperationStatus,
 };
