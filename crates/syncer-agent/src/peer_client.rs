@@ -1,9 +1,13 @@
+use std::collections::HashMap;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use camino::Utf8Path;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 use syncer_core::{FolderManifest, PeerPresence, RelativePath};
 use time::OffsetDateTime;
 
@@ -12,7 +16,7 @@ use crate::peer_server::PresenceResponse;
 use crate::request_signing::sign_request;
 
 const RESPONSE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
-const RESPONSE_HEADER_LIMIT_BYTES: u64 = 16 * 1024;
+const RESPONSE_HEADER_LIMIT_BYTES: usize = 16 * 1024;
 
 pub fn post_presence(
     endpoint: &str,
@@ -45,15 +49,17 @@ pub fn fetch_manifest(
     )
 }
 
-pub fn fetch_file(
+pub fn fetch_file_to_path(
     endpoint: &str,
     device_id: &str,
     shared_secret_hex: &str,
     path: &RelativePath,
     size_bytes: u64,
-) -> Result<Vec<u8>, PeerClientError> {
+    destination: &Utf8Path,
+) -> Result<TransferredFile, PeerClientError> {
     let request_path = format!("/file/{}", encode_relative_path(path));
-    request_bytes(&PeerRequest {
+    let address = PeerAddress::parse(endpoint)?;
+    let request = signed_request_header(&PeerRequest {
         method: "GET",
         endpoint,
         path: &request_path,
@@ -61,33 +67,73 @@ pub fn fetch_file(
         shared_secret_hex,
         body: &[],
         extra_headers: &[],
-        response_limit_bytes: size_bytes.saturating_add(RESPONSE_HEADER_LIMIT_BYTES),
+        response_limit_bytes: RESPONSE_LIMIT_BYTES as u64,
+    })?;
+    let mut stream = TcpStream::connect((&address.host[..], address.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(request.as_bytes())?;
+
+    let head = read_response_head(&mut stream)?;
+    if head.status != 200 {
+        return Err(PeerClientError::HttpStatus(head.status));
+    }
+    if head.content_length != size_bytes {
+        return Err(PeerClientError::UnexpectedContentLength {
+            expected: size_bytes,
+            actual: head.content_length,
+        });
+    }
+
+    let mut output = File::create(destination)?;
+    let mut hasher = blake3::Hasher::new();
+    let written = copy_exact_with_blake3(&mut stream, &mut output, size_bytes, &mut hasher)?;
+    output.sync_all()?;
+
+    Ok(TransferredFile {
+        size_bytes: written,
+        content_hash: hasher.finalize().to_hex().to_string(),
     })
-    .and_then(|response| parse_bytes_response(&response))
 }
 
-pub fn put_file(
+pub fn put_file_from_path(
     endpoint: &str,
     device_id: &str,
     shared_secret_hex: &str,
     path: &RelativePath,
     content_hash: &str,
-    bytes: &[u8],
+    file_path: &Utf8Path,
+    size_bytes: u64,
 ) -> Result<UploadFileResponse, PeerClientError> {
     let request_path = format!("/file/{}", encode_relative_path(path));
-    let extra_headers = vec![
-        ("x-syncer-content-hash".to_owned(), content_hash.to_owned()),
-        ("x-syncer-file-size".to_owned(), bytes.len().to_string()),
-    ];
-    request_json_with_body(
+    let body_sha256_hex = file_sha256_hex(file_path)?;
+    let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+    let signature = crate::request_signing::sign_request_with_body_hash_hex(
         "PUT",
-        endpoint,
         &request_path,
         device_id,
+        timestamp,
+        &body_sha256_hex,
         shared_secret_hex,
-        bytes,
-        &extra_headers,
-    )
+    )?;
+    let address = PeerAddress::parse(endpoint)?;
+    let request = format!(
+        "PUT {request_path} HTTP/1.1\r\nhost: {}\r\nx-syncer-device-id: {device_id}\r\nx-syncer-timestamp: {timestamp}\r\nx-syncer-signature: {signature}\r\ncontent-type: application/octet-stream\r\ncontent-length: {size_bytes}\r\nx-syncer-content-hash: {content_hash}\r\nx-syncer-file-size: {size_bytes}\r\nconnection: close\r\n\r\n",
+        address.host
+    );
+    let mut stream = TcpStream::connect((&address.host[..], address.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(request.as_bytes())?;
+    let mut file = File::open(file_path)?;
+    std::io::copy(&mut file, &mut stream)?;
+    stream.flush()?;
+
+    let mut response = Vec::new();
+    stream
+        .take(RESPONSE_LIMIT_BYTES as u64)
+        .read_to_end(&mut response)?;
+    parse_json_response(&response)
 }
 
 fn request_json<T: Serialize, R: DeserializeOwned>(
@@ -116,30 +162,24 @@ fn request_json<T: Serialize, R: DeserializeOwned>(
     parse_json_response(&response)
 }
 
-fn request_json_with_body<R: DeserializeOwned>(
-    method: &str,
-    endpoint: &str,
-    path: &str,
-    device_id: &str,
-    shared_secret_hex: &str,
-    body: &[u8],
-    extra_headers: &[(String, String)],
-) -> Result<R, PeerClientError> {
-    let response = request_bytes(&PeerRequest {
-        method,
-        endpoint,
-        path,
-        device_id,
-        shared_secret_hex,
-        body,
-        extra_headers,
-        response_limit_bytes: RESPONSE_LIMIT_BYTES as u64,
-    })?;
+fn request_bytes(request: &PeerRequest<'_>) -> Result<Vec<u8>, PeerClientError> {
+    let address = PeerAddress::parse(request.endpoint)?;
+    let serialized_request = signed_request_header(request)?;
 
-    parse_json_response(&response)
+    let mut stream = TcpStream::connect((&address.host[..], address.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(serialized_request.as_bytes())?;
+    stream.write_all(request.body)?;
+
+    let mut response = Vec::new();
+    stream
+        .take(request.response_limit_bytes)
+        .read_to_end(&mut response)?;
+    Ok(response)
 }
 
-fn request_bytes(request: &PeerRequest<'_>) -> Result<Vec<u8>, PeerClientError> {
+fn signed_request_header(request: &PeerRequest<'_>) -> Result<String, PeerClientError> {
     let address = PeerAddress::parse(request.endpoint)?;
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
     let signature = sign_request(
@@ -165,18 +205,7 @@ fn request_bytes(request: &PeerRequest<'_>) -> Result<Vec<u8>, PeerClientError> 
         serialized_request.push_str("\r\n");
     }
     serialized_request.push_str("connection: close\r\n\r\n");
-
-    let mut stream = TcpStream::connect((&address.host[..], address.port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(serialized_request.as_bytes())?;
-    stream.write_all(request.body)?;
-
-    let mut response = Vec::new();
-    stream
-        .take(request.response_limit_bytes)
-        .read_to_end(&mut response)?;
-    Ok(response)
+    Ok(serialized_request)
 }
 
 #[derive(Debug)]
@@ -195,6 +224,12 @@ struct PeerRequest<'request> {
 pub struct UploadFileResponse {
     pub accepted: bool,
     pub path: RelativePath,
+    pub size_bytes: u64,
+    pub content_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransferredFile {
     pub size_bytes: u64,
     pub content_hash: String,
 }
@@ -224,28 +259,94 @@ fn parse_json_response<R: DeserializeOwned>(response: &[u8]) -> Result<R, PeerCl
     serde_json::from_slice(body).map_err(PeerClientError::Json)
 }
 
-fn parse_bytes_response(response: &[u8]) -> Result<Vec<u8>, PeerClientError> {
-    let header_end = response
+fn read_response_head(reader: &mut impl Read) -> Result<ResponseHead, PeerClientError> {
+    let mut bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        reader.read_exact(&mut byte)?;
+        bytes.push(byte[0]);
+        if bytes.len() > RESPONSE_HEADER_LIMIT_BYTES {
+            return Err(PeerClientError::InvalidResponse);
+        }
+        if bytes.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let header_end = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .ok_or(PeerClientError::InvalidResponse)?;
-    let status_line = std::str::from_utf8(&response[..header_end])
-        .map_err(|_| PeerClientError::InvalidResponse)?
+    let header =
+        std::str::from_utf8(&bytes[..header_end]).map_err(|_| PeerClientError::InvalidResponse)?;
+    let status = header
         .lines()
         .next()
-        .ok_or(PeerClientError::InvalidResponse)?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(1))
         .ok_or(PeerClientError::InvalidResponse)?
         .parse::<u16>()
         .map_err(|_| PeerClientError::InvalidResponse)?;
+    let headers = parse_headers(header);
+    let content_length = headers
+        .get("content-length")
+        .ok_or(PeerClientError::InvalidResponse)?
+        .parse::<u64>()
+        .map_err(|_| PeerClientError::InvalidResponse)?;
+    Ok(ResponseHead {
+        status,
+        content_length,
+    })
+}
 
-    if status != 200 {
-        return Err(PeerClientError::HttpStatus(status));
+fn parse_headers(header: &str) -> HashMap<String, String> {
+    header
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        .collect()
+}
+
+fn copy_exact_with_blake3(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    expected: u64,
+    hasher: &mut blake3::Hasher,
+) -> Result<u64, PeerClientError> {
+    let mut remaining = expected;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining > 0 {
+        let read_limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| PeerClientError::InvalidResponse)?;
+        let read = reader.read(&mut buffer[..read_limit])?;
+        if read == 0 {
+            return Err(PeerClientError::InvalidResponse);
+        }
+        writer.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        remaining = remaining.saturating_sub(read as u64);
     }
+    Ok(expected)
+}
 
-    Ok(response[header_end + 4..].to_vec())
+fn file_sha256_hex(path: &Utf8Path) -> Result<String, PeerClientError> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[derive(Debug)]
+struct ResponseHead {
+    status: u16,
+    content_length: u64,
 }
 
 #[derive(Debug)]
@@ -288,6 +389,8 @@ pub enum PeerClientError {
     InvalidResponse,
     #[error("peer returned HTTP {0}")]
     HttpStatus(u16),
+    #[error("unexpected content length: expected {expected}, got {actual}")]
+    UnexpectedContentLength { expected: u64, actual: u64 },
     #[error("{0}")]
     Signing(#[from] crate::request_signing::SigningError),
 }

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use syncer_core::{
     ContentHash, FileEntry, FileKind, FileSyncState, FileVersion, FolderManifest, FolderStore,
     PeerPresence, RelativePath, StateDatabase,
@@ -14,9 +15,10 @@ use tokio::time::{Duration, timeout};
 use crate::path_codec::decode_relative_path;
 use crate::peer_store::PeerStoreDocument;
 use crate::profile::LocalDeviceProfile;
-use crate::request_signing::verify_request_signature;
+use crate::request_signing::verify_request_signature_with_body_hash_hex;
 
-const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_MEMORY_BODY_BYTES: u64 = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -43,13 +45,13 @@ async fn handle_stream(
     mut stream: TcpStream,
     config: PeerServerConfig,
 ) -> Result<(), PeerServerError> {
-    let response = match read_request(&mut stream).await {
+    let response = match read_request(&mut stream, &config).await {
         Ok(request) => route_request(&request, &config)
             .await
             .unwrap_or_else(|error| error_response(&error)),
         Err(error) => error_response(&error),
     };
-    stream.write_all(&response).await?;
+    write_response(&mut stream, response).await?;
     stream.shutdown().await?;
     Ok(())
 }
@@ -57,7 +59,7 @@ async fn handle_stream(
 async fn route_request(
     request: &HttpRequest,
     config: &PeerServerConfig,
-) -> Result<Vec<u8>, PeerServerError> {
+) -> Result<PeerResponse, PeerServerError> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => json_response(
             200,
@@ -68,7 +70,7 @@ async fn route_request(
         ),
         ("POST", "/presence") => {
             verify_peer_request(request, &config.peers_path)?;
-            let presence: PeerPresence = serde_json::from_slice(&request.body)?;
+            let presence: PeerPresence = serde_json::from_slice(request.memory_body()?)?;
             json_response(
                 200,
                 &PresenceResponse {
@@ -91,9 +93,14 @@ async fn route_request(
             verify_peer_request(request, &config.peers_path)?;
             let relative_path = decode_relative_path(path.trim_start_matches("/file/"))
                 .map_err(|_| PeerServerError::InvalidRequest)?;
-            let bytes =
-                read_shared_file(&config.folder_path, &config.profile, &relative_path).await?;
-            Ok(binary_response(200, "application/octet-stream", &bytes))
+            let shared_file =
+                shared_file(&config.folder_path, &config.profile, &relative_path).await?;
+            Ok(file_response(
+                200,
+                "application/octet-stream",
+                shared_file.path,
+                shared_file.size_bytes,
+            ))
         }
         ("PUT", path) if path.starts_with("/file/") => {
             verify_peer_request(request, &config.peers_path)?;
@@ -107,7 +114,7 @@ async fn route_request(
                 &relative_path,
                 expected_size,
                 expected_hash,
-                &request.body,
+                request.file_body()?,
             )
             .await?;
             json_response(200, &response)
@@ -121,11 +128,11 @@ async fn route_request(
     }
 }
 
-async fn read_shared_file(
+async fn shared_file(
     folder_path: &Utf8PathBuf,
     profile: &LocalDeviceProfile,
     relative_path: &syncer_core::RelativePath,
-) -> Result<Vec<u8>, PeerServerError> {
+) -> Result<SharedFile, PeerServerError> {
     let manifest = export_manifest(folder_path, profile).await?;
     let Some(file) = manifest
         .files
@@ -139,12 +146,10 @@ async fn read_shared_file(
     }
 
     let path = folder_path.join(relative_path.as_path());
-    tokio::fs::read(&path)
-        .await
-        .map_err(|error| PeerServerError::Filesystem {
-            path,
-            source: error,
-        })
+    Ok(SharedFile {
+        path,
+        size_bytes: file.size_bytes,
+    })
 }
 
 async fn write_uploaded_file(
@@ -153,18 +158,18 @@ async fn write_uploaded_file(
     relative_path: &RelativePath,
     expected_size: u64,
     expected_hash: &str,
-    bytes: &[u8],
+    body: FileBody,
 ) -> Result<UploadFileResponse, PeerServerError> {
-    let actual_size = u64::try_from(bytes.len()).map_err(|_| PeerServerError::FileSizeOverflow)?;
-    if actual_size != expected_size {
+    if body.size_bytes != expected_size {
         return Err(PeerServerError::InvalidRequest);
     }
-    let content_hash = ContentHash::from_bytes(bytes);
-    if content_hash.as_hex() != expected_hash {
+    let content_hash = blake3_file_hex(&body.path).await?;
+    if content_hash != expected_hash {
         return Err(PeerServerError::HashMismatch);
     }
 
     let store = FolderStore::new(folder_path.clone());
+    enforce_folder_limit(&store, expected_size).await?;
     let target = folder_path.join(relative_path.as_path());
     if tokio::fs::try_exists(&target)
         .await
@@ -176,16 +181,16 @@ async fn write_uploaded_file(
         return Err(PeerServerError::Conflict);
     }
 
-    publish_uploaded_file(&store, relative_path, bytes).await?;
+    publish_uploaded_file(&store, relative_path, &body.path).await?;
     store.read().await?;
     let database = StateDatabase::open(&store.state_db_path()).await?;
     database
         .upsert_file(&FileEntry {
             path: relative_path.clone(),
             kind: FileKind::File,
-            size_bytes: actual_size,
+            size_bytes: expected_size,
             modified_at: OffsetDateTime::now_utc(),
-            content_hash: Some(content_hash),
+            content_hash: Some(ContentHash::from_hex(content_hash.clone())),
             block_hashes: Vec::new(),
             version: FileVersion {
                 generation: 1,
@@ -197,31 +202,62 @@ async fn write_uploaded_file(
     Ok(UploadFileResponse {
         accepted: true,
         path: relative_path.clone(),
-        size_bytes: actual_size,
+        size_bytes: expected_size,
         content_hash: expected_hash.to_owned(),
     })
+}
+
+async fn enforce_folder_limit(
+    store: &FolderStore,
+    incoming_size: u64,
+) -> Result<(), PeerServerError> {
+    let folder = store.read().await?;
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    let status = database.folder_status().await?;
+    let remaining = folder
+        .folder
+        .size_limit
+        .remaining_bytes(status.indexed_bytes);
+    if incoming_size > remaining {
+        return Err(PeerServerError::FolderLimitExceeded {
+            remaining,
+            requested: incoming_size,
+        });
+    }
+    Ok(())
+}
+
+async fn blake3_file_hex(path: &camino::Utf8Path) -> Result<String, PeerServerError> {
+    let mut file =
+        tokio::fs::File::open(path)
+            .await
+            .map_err(|source| PeerServerError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|source| PeerServerError::Filesystem {
+                path: path.to_owned(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 async fn publish_uploaded_file(
     store: &FolderStore,
     relative_path: &RelativePath,
-    bytes: &[u8],
+    temporary: &camino::Utf8Path,
 ) -> Result<(), PeerServerError> {
-    let temporary_dir = store.syncer_dir().join("tmp").join("uploads");
-    tokio::fs::create_dir_all(&temporary_dir)
-        .await
-        .map_err(|source| PeerServerError::Filesystem {
-            path: temporary_dir.clone(),
-            source,
-        })?;
-    let temporary = temporary_dir.join(format!("{}.part", uuid::Uuid::now_v7()));
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .map_err(|source| PeerServerError::Filesystem {
-            path: temporary.clone(),
-            source,
-        })?;
-
     let target = store.root().join(relative_path.as_path());
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent)
@@ -231,7 +267,7 @@ async fn publish_uploaded_file(
                 source,
             })?;
     }
-    tokio::fs::rename(&temporary, &target)
+    tokio::fs::rename(temporary, &target)
         .await
         .map_err(|source| PeerServerError::Filesystem {
             path: target,
@@ -252,7 +288,10 @@ async fn export_manifest(
         .map_err(PeerServerError::Core)
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, PeerServerError> {
+async fn read_request(
+    stream: &mut TcpStream,
+    config: &PeerServerConfig,
+) -> Result<HttpRequest, PeerServerError> {
     let mut buffer = Vec::new();
     let mut temporary = [0_u8; 4096];
 
@@ -264,30 +303,22 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, PeerServerE
             break;
         }
         buffer.extend_from_slice(&temporary[..read]);
-        if buffer.len() > MAX_REQUEST_BYTES {
+        if buffer.len() > MAX_HEADER_BYTES {
             return Err(PeerServerError::RequestTooLarge);
         }
-        if request_complete(&buffer)? {
+        if find_header_end(&buffer).is_some() {
             break;
         }
     }
 
-    parse_request(&buffer)
+    parse_request(stream, config, &buffer).await
 }
 
-fn request_complete(buffer: &[u8]) -> Result<bool, PeerServerError> {
-    let Some(header_end) = find_header_end(buffer) else {
-        return Ok(false);
-    };
-    let headers = parse_headers(&buffer[..header_end])?;
-    let content_length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    Ok(buffer.len() >= header_end + 4 + content_length)
-}
-
-fn parse_request(buffer: &[u8]) -> Result<HttpRequest, PeerServerError> {
+async fn parse_request(
+    stream: &mut TcpStream,
+    config: &PeerServerConfig,
+    buffer: &[u8],
+) -> Result<HttpRequest, PeerServerError> {
     let header_end = find_header_end(buffer).ok_or(PeerServerError::InvalidRequest)?;
     let header_bytes = &buffer[..header_end];
     let headers = parse_headers(header_bytes)?;
@@ -310,20 +341,136 @@ fn parse_request(buffer: &[u8]) -> Result<HttpRequest, PeerServerError> {
         .to_owned();
     let content_length = headers
         .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let body_start = header_end + 4;
-    let body_end = body_start.saturating_add(content_length);
-    if body_end > buffer.len() {
-        return Err(PeerServerError::InvalidRequest);
-    }
+    let body_prefix = &buffer[body_start..];
+    let body = if should_spool_body(&method, &path, content_length) {
+        read_file_body(stream, config, body_prefix, content_length).await?
+    } else {
+        read_memory_body(stream, body_prefix, content_length).await?
+    };
+    let body_sha256_hex = body.sha256_hex();
 
     Ok(HttpRequest {
         method,
         path,
         headers,
-        body: buffer[body_start..body_end].to_vec(),
+        body_sha256_hex,
+        body,
     })
+}
+
+fn should_spool_body(method: &str, path: &str, content_length: u64) -> bool {
+    method == "PUT" && path.starts_with("/file/") && content_length > 0
+}
+
+async fn read_memory_body(
+    stream: &mut TcpStream,
+    body_prefix: &[u8],
+    content_length: u64,
+) -> Result<HttpBody, PeerServerError> {
+    if content_length > MAX_MEMORY_BODY_BYTES {
+        return Err(PeerServerError::RequestTooLarge);
+    }
+    let content_length_usize =
+        usize::try_from(content_length).map_err(|_| PeerServerError::RequestTooLarge)?;
+    if body_prefix.len() > content_length_usize {
+        return Err(PeerServerError::InvalidRequest);
+    }
+
+    let mut body = Vec::with_capacity(content_length_usize);
+    body.extend_from_slice(body_prefix);
+    while body.len() < content_length_usize {
+        let remaining = content_length_usize.saturating_sub(body.len());
+        let mut chunk = vec![0_u8; remaining.min(4096)];
+        let read = timeout(REQUEST_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| PeerServerError::RequestTimeout)??;
+        if read == 0 {
+            return Err(PeerServerError::InvalidRequest);
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(HttpBody::Memory(body))
+}
+
+async fn read_file_body(
+    stream: &mut TcpStream,
+    config: &PeerServerConfig,
+    body_prefix: &[u8],
+    content_length: u64,
+) -> Result<HttpBody, PeerServerError> {
+    if u64::try_from(body_prefix.len()).map_err(|_| PeerServerError::RequestTooLarge)?
+        > content_length
+    {
+        return Err(PeerServerError::InvalidRequest);
+    }
+
+    let temporary_dir = FolderStore::new(config.folder_path.clone())
+        .syncer_dir()
+        .join("tmp")
+        .join("requests");
+    tokio::fs::create_dir_all(&temporary_dir)
+        .await
+        .map_err(|source| PeerServerError::Filesystem {
+            path: temporary_dir.clone(),
+            source,
+        })?;
+    let path = temporary_dir.join(format!("{}.body", uuid::Uuid::now_v7()));
+    let mut file =
+        tokio::fs::File::create(&path)
+            .await
+            .map_err(|source| PeerServerError::Filesystem {
+                path: path.clone(),
+                source,
+            })?;
+    let mut hasher = Sha256::new();
+    if !body_prefix.is_empty() {
+        file.write_all(body_prefix)
+            .await
+            .map_err(|source| PeerServerError::Filesystem {
+                path: path.clone(),
+                source,
+            })?;
+        hasher.update(body_prefix);
+    }
+
+    let mut written =
+        u64::try_from(body_prefix.len()).map_err(|_| PeerServerError::RequestTooLarge)?;
+    let mut chunk = vec![0_u8; 64 * 1024];
+    while written < content_length {
+        let remaining = content_length.saturating_sub(written);
+        let read_limit = usize::try_from(remaining.min(chunk.len() as u64))
+            .map_err(|_| PeerServerError::RequestTooLarge)?;
+        let read = timeout(REQUEST_TIMEOUT, stream.read(&mut chunk[..read_limit]))
+            .await
+            .map_err(|_| PeerServerError::RequestTimeout)??;
+        if read == 0 {
+            return Err(PeerServerError::InvalidRequest);
+        }
+        file.write_all(&chunk[..read])
+            .await
+            .map_err(|source| PeerServerError::Filesystem {
+                path: path.clone(),
+                source,
+            })?;
+        hasher.update(&chunk[..read]);
+        written = written.saturating_add(read as u64);
+    }
+    file.sync_all()
+        .await
+        .map_err(|source| PeerServerError::Filesystem {
+            path: path.clone(),
+            source,
+        })?;
+
+    Ok(HttpBody::File(FileBody {
+        path,
+        size_bytes: content_length,
+        sha256_hex: hex::encode(hasher.finalize()),
+    }))
 }
 
 fn parse_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, PeerServerError> {
@@ -370,13 +517,13 @@ fn verify_peer_request(
     let peer = peers
         .trusted_peer(device_id)
         .ok_or(PeerServerError::Unauthorized)?;
-    verify_request_signature(
+    verify_request_signature_with_body_hash_hex(
         signature,
         &request.method,
         &request.path,
         &device_id.to_string(),
         timestamp,
-        &request.body,
+        &request.body_sha256_hex,
         &peer.shared_secret_hex,
     )?;
     Ok(())
@@ -399,12 +546,33 @@ fn required_u64_header(request: &HttpRequest, name: &str) -> Result<u64, PeerSer
         .map_err(|_| PeerServerError::InvalidRequest)
 }
 
-fn json_response<T: Serialize>(status: u16, value: &T) -> Result<Vec<u8>, PeerServerError> {
+fn json_response<T: Serialize>(status: u16, value: &T) -> Result<PeerResponse, PeerServerError> {
     let body = serde_json::to_vec(value)?;
-    Ok(binary_response(status, "application/json", &body))
+    Ok(PeerResponse::Bytes(binary_response(
+        status,
+        "application/json",
+        &body,
+    )))
+}
+
+fn file_response(
+    status: u16,
+    content_type: &'static str,
+    path: Utf8PathBuf,
+    size_bytes: u64,
+) -> PeerResponse {
+    let header = response_header(status, content_type, size_bytes);
+    PeerResponse::File { header, path }
 }
 
 fn binary_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let header = response_header(status, content_type, body.len() as u64);
+    let mut response = header.into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn response_header(status: u16, content_type: &str, content_length: u64) -> String {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -414,16 +582,12 @@ fn binary_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         413 => "Payload Too Large",
         _ => "Internal Server Error",
     };
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    let mut response = header.into_bytes();
-    response.extend_from_slice(body);
-    response
+    format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {content_length}\r\nconnection: close\r\n\r\n"
+    )
 }
 
-fn error_response(error: &PeerServerError) -> Vec<u8> {
+fn error_response(error: &PeerServerError) -> PeerResponse {
     let status = match error {
         PeerServerError::Unauthorized
         | PeerServerError::PeerStore(_)
@@ -434,7 +598,7 @@ fn error_response(error: &PeerServerError) -> Vec<u8> {
         PeerServerError::RequestTimeout => 408,
         PeerServerError::InvalidRequest
         | PeerServerError::HashMismatch
-        | PeerServerError::FileSizeOverflow
+        | PeerServerError::FolderLimitExceeded { .. }
         | PeerServerError::Json(_) => 400,
         PeerServerError::Io(_) | PeerServerError::Core(_) | PeerServerError::Filesystem { .. } => {
             500
@@ -447,10 +611,45 @@ fn error_response(error: &PeerServerError) -> Vec<u8> {
         },
     )
     .unwrap_or_else(|_| {
-        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-            .as_bytes()
-            .to_vec()
+        PeerResponse::Bytes(
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .as_bytes()
+                .to_vec(),
+        )
     })
+}
+
+async fn write_response(
+    stream: &mut TcpStream,
+    response: PeerResponse,
+) -> Result<(), PeerServerError> {
+    match response {
+        PeerResponse::Bytes(bytes) => stream.write_all(&bytes).await?,
+        PeerResponse::File { header, path } => {
+            stream.write_all(header.as_bytes()).await?;
+            let mut file = tokio::fs::File::open(&path).await.map_err(|source| {
+                PeerServerError::Filesystem {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let read =
+                    file.read(&mut buffer)
+                        .await
+                        .map_err(|source| PeerServerError::Filesystem {
+                            path: path.clone(),
+                            source,
+                        })?;
+                if read == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..read]).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -458,7 +657,61 @@ struct HttpRequest {
     method: String,
     path: String,
     headers: HashMap<String, String>,
-    body: Vec<u8>,
+    body_sha256_hex: String,
+    body: HttpBody,
+}
+
+impl HttpRequest {
+    fn memory_body(&self) -> Result<&[u8], PeerServerError> {
+        match &self.body {
+            HttpBody::Memory(bytes) => Ok(bytes),
+            HttpBody::File(_) => Err(PeerServerError::InvalidRequest),
+        }
+    }
+
+    fn file_body(&self) -> Result<FileBody, PeerServerError> {
+        match &self.body {
+            HttpBody::Memory(_) => Err(PeerServerError::InvalidRequest),
+            HttpBody::File(body) => Ok(body.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum HttpBody {
+    Memory(Vec<u8>),
+    File(FileBody),
+}
+
+impl HttpBody {
+    fn sha256_hex(&self) -> String {
+        match self {
+            Self::Memory(bytes) => {
+                let digest = Sha256::digest(bytes);
+                hex::encode(digest)
+            }
+            Self::File(body) => body.sha256_hex.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FileBody {
+    path: Utf8PathBuf,
+    size_bytes: u64,
+    sha256_hex: String,
+}
+
+#[derive(Debug)]
+enum PeerResponse {
+    Bytes(Vec<u8>),
+    File { header: String, path: Utf8PathBuf },
+}
+
+#[derive(Debug)]
+struct SharedFile {
+    path: Utf8PathBuf,
+    size_bytes: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -512,8 +765,8 @@ pub enum PeerServerError {
     Conflict,
     #[error("content hash does not match body")]
     HashMismatch,
-    #[error("file size exceeded supported range")]
-    FileSizeOverflow,
+    #[error("folder size limit exceeded: requested {requested}, remaining {remaining}")]
+    FolderLimitExceeded { remaining: u64, requested: u64 },
     #[error("unauthorized peer request")]
     Unauthorized,
     #[error("{0}")]
@@ -531,7 +784,7 @@ impl PeerServerError {
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::HashMismatch => "hash_mismatch",
-            Self::FileSizeOverflow => "file_size_overflow",
+            Self::FolderLimitExceeded { .. } => "folder_limit_exceeded",
             Self::Unauthorized | Self::PeerStore(_) | Self::Signing(_) => "unauthorized",
             Self::Io(_) | Self::Core(_) | Self::Filesystem { .. } => "internal_error",
         }
@@ -549,7 +802,7 @@ mod tests {
 
     use crate::profile::LocalDeviceProfile;
 
-    use super::{PeerServerError, read_shared_file, write_uploaded_file};
+    use super::{FileBody, PeerServerError, shared_file, write_uploaded_file};
 
     #[tokio::test]
     async fn reads_only_indexed_shared_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -571,20 +824,21 @@ mod tests {
         let scanner = LinuxFolderScanner::from_std_path(&root, profile.device_id)?;
         scanner.scan_into(&database).await?;
 
-        let bytes = read_shared_file(
+        let file = shared_file(
             &folder.root().to_owned(),
             &profile,
             &RelativePath::parse("docs/readme.txt")?,
         )
         .await?;
-        let missing = read_shared_file(
+        let missing = shared_file(
             &folder.root().to_owned(),
             &profile,
             &RelativePath::parse("docs/missing.txt")?,
         )
         .await;
 
-        assert_eq!(bytes, b"hello peer");
+        assert_eq!(fs::read(file.path)?, b"hello peer");
+        assert_eq!(file.size_bytes, 10);
         assert!(missing.is_err());
         fs::remove_dir_all(root).ok();
         Ok(())
@@ -609,6 +863,10 @@ mod tests {
         let profile = LocalDeviceProfile::create("peer".to_owned())?;
         let body = b"uploaded body";
         let hash = ContentHash::from_bytes(body);
+        let first_body_path = folder.syncer_dir().join("first-upload.body");
+        let second_body_path = folder.syncer_dir().join("second-upload.body");
+        fs::write(&first_body_path, body)?;
+        fs::write(&second_body_path, body)?;
 
         let response = write_uploaded_file(
             &folder.root().to_owned(),
@@ -616,7 +874,11 @@ mod tests {
             &RelativePath::parse("incoming/file.txt")?,
             body.len() as u64,
             hash.as_hex(),
-            body,
+            FileBody {
+                path: first_body_path,
+                size_bytes: body.len() as u64,
+                sha256_hex: String::new(),
+            },
         )
         .await?;
         let duplicate = write_uploaded_file(
@@ -625,7 +887,11 @@ mod tests {
             &RelativePath::parse("incoming/file.txt")?,
             body.len() as u64,
             hash.as_hex(),
-            body,
+            FileBody {
+                path: second_body_path,
+                size_bytes: body.len() as u64,
+                sha256_hex: String::new(),
+            },
         )
         .await;
         let database = StateDatabase::open(&folder.state_db_path()).await?;

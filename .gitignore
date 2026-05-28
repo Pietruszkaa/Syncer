@@ -6,6 +6,7 @@
 *.iml
 *.log
 .DS_Store
+.codex
 
 # Local Syncer runtime state.
 .syncer-local/

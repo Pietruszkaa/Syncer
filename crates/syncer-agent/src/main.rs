@@ -573,34 +573,18 @@ async fn upload_operation(
     }
 
     let target = store.root().join(operation.path.as_path());
-    let bytes = tokio::fs::read(&target)
-        .await
-        .map_err(|source| TransferError::Filesystem {
-            path: target,
-            source,
-        })?;
-    let uploaded_size = u64::try_from(bytes.len()).map_err(|_| TransferError::FileSizeOverflow)?;
-    if uploaded_size != local_file.size_bytes {
-        return Err(TransferError::SizeMismatch {
-            expected: local_file.size_bytes,
-            actual: uploaded_size,
-        });
-    }
-    let content_hash = ContentHash::from_bytes(&bytes);
-    if content_hash.as_hex() != expected_hash {
-        return Err(TransferError::HashMismatch);
-    }
-    let response = peer_client::put_file(
+    let response = peer_client::put_file_from_path(
         endpoint,
         &profile.device_id.to_string(),
         shared_secret,
         &operation.path,
         expected_hash,
-        &bytes,
+        &target,
+        local_file.size_bytes,
     )?;
     if !response.accepted
         || response.path != operation.path
-        || response.size_bytes != uploaded_size
+        || response.size_bytes != local_file.size_bytes
         || response.content_hash != expected_hash
     {
         return Err(TransferError::UploadRejected);
@@ -611,7 +595,7 @@ async fn upload_operation(
         operation_id: operation.id.clone(),
         path: operation.path.clone(),
         status: "done",
-        size_bytes: uploaded_size,
+        size_bytes: local_file.size_bytes,
         error: None,
     })
 }
@@ -667,6 +651,7 @@ async fn download_operation(
     {
         return Err(TransferError::RemoteFileChanged);
     }
+    enforce_local_download_limit(store, database, &operation.path, remote_file.size_bytes).await?;
 
     let target = store.root().join(operation.path.as_path());
     if tokio::fs::try_exists(&target)
@@ -679,34 +664,33 @@ async fn download_operation(
         return Err(TransferError::LocalTargetExists);
     }
 
-    let bytes = peer_client::fetch_file(
+    let temporary = download_temporary_path(store, &operation.id).await?;
+    let transferred = peer_client::fetch_file_to_path(
         endpoint,
         &profile.device_id.to_string(),
         shared_secret,
         &operation.path,
         remote_file.size_bytes,
+        &temporary,
     )?;
-    let downloaded_size =
-        u64::try_from(bytes.len()).map_err(|_| TransferError::FileSizeOverflow)?;
-    if downloaded_size != remote_file.size_bytes {
+    if transferred.size_bytes != remote_file.size_bytes {
         return Err(TransferError::SizeMismatch {
             expected: remote_file.size_bytes,
-            actual: downloaded_size,
+            actual: transferred.size_bytes,
         });
     }
-    let content_hash = ContentHash::from_bytes(&bytes);
-    if content_hash.as_hex() != expected_hash {
+    if transferred.content_hash != expected_hash {
         return Err(TransferError::HashMismatch);
     }
 
-    publish_download(store, &operation.id, &operation.path, &bytes).await?;
+    publish_download(store, &operation.path, &temporary).await?;
     database
         .upsert_file(&FileEntry {
             path: operation.path.clone(),
             kind: FileKind::File,
-            size_bytes: downloaded_size,
+            size_bytes: transferred.size_bytes,
             modified_at: OffsetDateTime::now_utc(),
-            content_hash: Some(content_hash),
+            content_hash: Some(ContentHash::from_hex(transferred.content_hash.clone())),
             block_hashes: Vec::new(),
             version: FileVersion {
                 generation: remote_file.generation,
@@ -720,17 +704,44 @@ async fn download_operation(
         operation_id: operation.id.clone(),
         path: operation.path.clone(),
         status: "done",
-        size_bytes: downloaded_size,
+        size_bytes: transferred.size_bytes,
         error: None,
     })
 }
 
-async fn publish_download(
+async fn enforce_local_download_limit(
+    store: &FolderStore,
+    database: &StateDatabase,
+    relative_path: &RelativePath,
+    size_bytes: u64,
+) -> Result<(), TransferError> {
+    let folder = store.read().await?;
+    let status = database.folder_status().await?;
+    let remaining = folder
+        .folder
+        .size_limit
+        .remaining_bytes(status.indexed_bytes);
+    if size_bytes > remaining {
+        database
+            .record_skipped_folder_limit(&PendingTransfer {
+                operation_id: syncer_core::OperationId::new(),
+                path: relative_path.clone(),
+                size_bytes,
+                queued_at: OffsetDateTime::now_utc(),
+            })
+            .await?;
+        return Err(TransferError::FolderLimitExceeded {
+            remaining,
+            requested: size_bytes,
+        });
+    }
+    Ok(())
+}
+
+async fn download_temporary_path(
     store: &FolderStore,
     operation_id: &str,
-    relative_path: &RelativePath,
-    bytes: &[u8],
-) -> Result<(), TransferError> {
+) -> Result<Utf8PathBuf, TransferError> {
     let temporary_dir = store.syncer_dir().join("tmp").join("downloads");
     tokio::fs::create_dir_all(&temporary_dir)
         .await
@@ -738,14 +749,14 @@ async fn publish_download(
             path: temporary_dir.clone(),
             source,
         })?;
-    let temporary = temporary_dir.join(format!("{operation_id}.part"));
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .map_err(|source| TransferError::Filesystem {
-            path: temporary.clone(),
-            source,
-        })?;
+    Ok(temporary_dir.join(format!("{operation_id}.part")))
+}
 
+async fn publish_download(
+    store: &FolderStore,
+    relative_path: &RelativePath,
+    temporary: &camino::Utf8Path,
+) -> Result<(), TransferError> {
     let target = store.root().join(relative_path.as_path());
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent)
@@ -755,7 +766,7 @@ async fn publish_download(
                 source,
             })?;
     }
-    tokio::fs::rename(&temporary, &target)
+    tokio::fs::rename(temporary, &target)
         .await
         .map_err(|source| TransferError::Filesystem {
             path: target,
@@ -992,8 +1003,8 @@ enum TransferError {
     SizeMismatch { expected: u64, actual: u64 },
     #[error("downloaded file hash does not match remote manifest")]
     HashMismatch,
-    #[error("file size exceeded supported range")]
-    FileSizeOverflow,
+    #[error("folder size limit exceeded: requested {requested}, remaining {remaining}")]
+    FolderLimitExceeded { remaining: u64, requested: u64 },
     #[error("filesystem error at {path}: {source}")]
     Filesystem {
         path: Utf8PathBuf,

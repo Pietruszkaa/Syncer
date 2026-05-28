@@ -66,6 +66,11 @@ pub struct ContentHash(String);
 
 impl ContentHash {
     #[must_use]
+    pub fn from_hex(value: String) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self(blake3::hash(bytes).to_hex().to_string())
     }

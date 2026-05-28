@@ -11,12 +11,41 @@ pub fn sign_request(
     body: &[u8],
     shared_secret_hex: &str,
 ) -> Result<String, SigningError> {
+    let body_hash = Sha256::digest(body);
+    sign_request_with_body_hash_hex(
+        method,
+        path,
+        device_id,
+        timestamp_unix,
+        &hex::encode(body_hash),
+        shared_secret_hex,
+    )
+}
+
+pub fn sign_request_with_body_hash_hex(
+    method: &str,
+    path: &str,
+    device_id: &str,
+    timestamp_unix: i64,
+    body_hash_hex: &str,
+    shared_secret_hex: &str,
+) -> Result<String, SigningError> {
     let secret = hex::decode(shared_secret_hex)?;
     let mut mac = HmacSha256::new_from_slice(&secret).map_err(|_| SigningError::InvalidSecret)?;
-    mac.update(canonical_payload(method, path, device_id, timestamp_unix, body).as_bytes());
+    mac.update(
+        canonical_payload_with_body_hash_hex(
+            method,
+            path,
+            device_id,
+            timestamp_unix,
+            body_hash_hex,
+        )
+        .as_bytes(),
+    );
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
+#[cfg(test)]
 pub fn verify_request_signature(
     signature_hex: &str,
     method: &str,
@@ -26,26 +55,52 @@ pub fn verify_request_signature(
     body: &[u8],
     shared_secret_hex: &str,
 ) -> Result<(), SigningError> {
-    let secret = hex::decode(shared_secret_hex)?;
-    let signature = hex::decode(signature_hex)?;
-    let mut mac = HmacSha256::new_from_slice(&secret).map_err(|_| SigningError::InvalidSecret)?;
-    mac.update(canonical_payload(method, path, device_id, timestamp_unix, body).as_bytes());
-    mac.verify_slice(&signature)
-        .map_err(|_| SigningError::InvalidSignature)
+    let body_hash = Sha256::digest(body);
+    verify_request_signature_with_body_hash_hex(
+        signature_hex,
+        method,
+        path,
+        device_id,
+        timestamp_unix,
+        &hex::encode(body_hash),
+        shared_secret_hex,
+    )
 }
 
-fn canonical_payload(
+pub fn verify_request_signature_with_body_hash_hex(
+    signature_hex: &str,
     method: &str,
     path: &str,
     device_id: &str,
     timestamp_unix: i64,
-    body: &[u8],
+    body_hash_hex: &str,
+    shared_secret_hex: &str,
+) -> Result<(), SigningError> {
+    let secret = hex::decode(shared_secret_hex)?;
+    let signature = hex::decode(signature_hex)?;
+    let mut mac = HmacSha256::new_from_slice(&secret).map_err(|_| SigningError::InvalidSecret)?;
+    mac.update(
+        canonical_payload_with_body_hash_hex(
+            method,
+            path,
+            device_id,
+            timestamp_unix,
+            body_hash_hex,
+        )
+        .as_bytes(),
+    );
+    mac.verify_slice(&signature)
+        .map_err(|_| SigningError::InvalidSignature)
+}
+
+fn canonical_payload_with_body_hash_hex(
+    method: &str,
+    path: &str,
+    device_id: &str,
+    timestamp_unix: i64,
+    body_hash_hex: &str,
 ) -> String {
-    let body_hash = Sha256::digest(body);
-    format!(
-        "{method}\n{path}\n{device_id}\n{timestamp_unix}\n{}",
-        hex::encode(body_hash)
-    )
+    format!("{method}\n{path}\n{device_id}\n{timestamp_unix}\n{body_hash_hex}")
 }
 
 #[derive(Debug, thiserror::Error)]
