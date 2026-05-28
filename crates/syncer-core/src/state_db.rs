@@ -7,6 +7,7 @@ use sqlx::{
 use time::OffsetDateTime;
 
 use crate::error::{CoreError, CoreResult};
+use crate::ids::{DeviceId, FolderId};
 use crate::manifest::{ContentHash, FileEntry, FileKind, RelativePath};
 
 const SCHEMA_VERSION: i64 = 2;
@@ -267,6 +268,24 @@ impl StateDatabase {
         Ok(status)
     }
 
+    /// Exports the indexed folder manifest for peer comparison.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the query.
+    pub async fn export_manifest(
+        &self,
+        folder_id: FolderId,
+        device_id: DeviceId,
+    ) -> CoreResult<FolderManifest> {
+        Ok(FolderManifest {
+            folder_id,
+            device_id,
+            generated_at: OffsetDateTime::now_utc(),
+            files: self.list_files().await?,
+        })
+    }
+
     async fn migrate(&self) -> CoreResult<()> {
         sqlx::query("PRAGMA journal_mode = WAL")
             .execute(&self.pool)
@@ -418,6 +437,15 @@ pub struct FolderStatus {
     pub pending_upload: u64,
     pub pending_download: u64,
     pub skipped_folder_limit: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FolderManifest {
+    pub folder_id: FolderId,
+    pub device_id: DeviceId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub generated_at: OffsetDateTime,
+    pub files: Vec<FileRecord>,
 }
 
 fn row_to_file_record(row: &sqlx::sqlite::SqliteRow) -> CoreResult<FileRecord> {

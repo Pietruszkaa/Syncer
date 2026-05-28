@@ -21,9 +21,13 @@ pub use model::{
     DeleteScope, DeviceName, FolderConfig, FolderMode, FolderPeer, PeerEndpoint, RetentionPolicy,
     StorageRoot,
 };
-pub use planning::{ChangeClassification, FilePresence, classify_file_presence};
+pub use planning::{
+    ChangeClassification, FilePresence, SyncAction, SyncPlan, SyncPlanEntry, SyncPlanSummary,
+    classify_file_presence, plan_manifest_sync,
+};
 pub use scanner::{LinuxFolderScanner, ScanSummary};
 pub use security::{PairingTicket, PeerPresence, PublicKeyBytes};
 pub use state_db::{
-    FileRecord, FileSyncState, FolderStatus, SkippedFileRecord, SkippedReason, StateDatabase,
+    FileRecord, FileSyncState, FolderManifest, FolderStatus, SkippedFileRecord, SkippedReason,
+    StateDatabase,
 };

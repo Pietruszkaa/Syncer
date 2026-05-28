@@ -1,5 +1,6 @@
 use rand::random;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use syncer_core::{DeviceId, DeviceName};
 use time::OffsetDateTime;
 
@@ -10,15 +11,22 @@ pub struct LocalDeviceProfile {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub local_api_token_hex: String,
+    pub identity_public_hex: String,
+    pub identity_secret_hex: String,
 }
 
 impl LocalDeviceProfile {
     pub fn create(name: String) -> Result<Self, syncer_core::CoreError> {
+        let identity_secret: [u8; 32] = random();
+        let identity_public_hex = public_identity_hex(&identity_secret);
+
         Ok(Self {
             device_id: DeviceId::new(),
             device_name: DeviceName::parse(name)?,
             created_at: OffsetDateTime::now_utc(),
             local_api_token_hex: hex_token(random()),
+            identity_public_hex,
+            identity_secret_hex: hex_token(identity_secret),
         })
     }
 
@@ -33,6 +41,11 @@ impl LocalDeviceProfile {
 
 fn hex_token(bytes: [u8; 32]) -> String {
     hex::encode(bytes)
+}
+
+fn public_identity_hex(secret: &[u8; 32]) -> String {
+    let digest = Sha256::digest(secret);
+    hex::encode(digest)
 }
 
 #[derive(Debug, thiserror::Error)]
