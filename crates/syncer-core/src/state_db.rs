@@ -371,6 +371,34 @@ impl StateDatabase {
         remote_device_id: &str,
         limit: u64,
     ) -> CoreResult<Vec<SyncOperationRecord>> {
+        self.list_pending_operations(
+            remote_device_id,
+            SyncOperationKind::DownloadFromRemote,
+            limit,
+        )
+        .await
+    }
+
+    /// Lists pending upload operations for one remote peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the query.
+    pub async fn list_pending_upload_operations(
+        &self,
+        remote_device_id: &str,
+        limit: u64,
+    ) -> CoreResult<Vec<SyncOperationRecord>> {
+        self.list_pending_operations(remote_device_id, SyncOperationKind::UploadToRemote, limit)
+            .await
+    }
+
+    async fn list_pending_operations(
+        &self,
+        remote_device_id: &str,
+        kind: SyncOperationKind,
+        limit: u64,
+    ) -> CoreResult<Vec<SyncOperationRecord>> {
         let limit = i64::try_from(limit).map_err(|_| CoreError::FileSizeOverflow)?;
         let rows = sqlx::query(
             r"
@@ -379,13 +407,14 @@ impl StateDatabase {
                    last_error, created_at_unix, updated_at_unix
             FROM sync_operations
             WHERE remote_device_id = ?1
-              AND kind = 'download_from_remote'
+              AND kind = ?2
               AND status = 'pending'
             ORDER BY created_at_unix, path
-            LIMIT ?2
+            LIMIT ?3
             ",
         )
         .bind(remote_device_id)
+        .bind(kind.as_str())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -1107,6 +1136,30 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(status.done, 1);
         assert_eq!(status.pending, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_pending_upload_operations() -> Result<(), crate::CoreError> {
+        let database = StateDatabase::in_memory().await?;
+        let remote_device_id = DeviceId::new().to_string();
+        let plan = SyncPlan {
+            local_device_id: DeviceId::new().to_string(),
+            remote_device_id: remote_device_id.clone(),
+            entries: vec![
+                plan_entry("upload.txt", SyncAction::UploadToRemote),
+                plan_entry("download.txt", SyncAction::DownloadFromRemote),
+            ],
+            summary: SyncPlanSummary::default(),
+        };
+
+        database.enqueue_sync_plan(&plan).await?;
+        let uploads = database
+            .list_pending_upload_operations(&remote_device_id, 10)
+            .await?;
+
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].path.as_path().as_str(), "upload.txt");
         Ok(())
     }
 

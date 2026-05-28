@@ -446,18 +446,25 @@ async fn execute_sync_queue(
     device_config: &Utf8PathBuf,
 ) -> Result<(), AgentError> {
     let profile = LocalDeviceProfile::read(device_config)?;
-    let store = FolderStore::new(path);
+    let store = FolderStore::new(path.clone());
     let database = StateDatabase::open(&store.state_db_path()).await?;
+    let scanner = LinuxFolderScanner::new(path, profile.device_id);
+    scanner.scan_into(&database).await?;
     let remote_manifest =
         peer_client::fetch_manifest(endpoint, &profile.device_id.to_string(), shared_secret)?;
-    let operations = database
-        .list_pending_download_operations(&remote_manifest.device_id.to_string(), limit)
+    let remote_device_id = remote_manifest.device_id.to_string();
+    let download_operations = database
+        .list_pending_download_operations(&remote_device_id, limit)
         .await?;
-    let mut results = Vec::with_capacity(operations.len());
+    let remaining_limit = limit.saturating_sub(download_operations.len() as u64);
+    let upload_operations = database
+        .list_pending_upload_operations(&remote_device_id, remaining_limit)
+        .await?;
+    let mut results = Vec::with_capacity(download_operations.len() + upload_operations.len());
     let mut completed = 0_u64;
     let mut failed = 0_u64;
 
-    for operation in operations {
+    for operation in download_operations {
         match download_operation(
             &store,
             &database,
@@ -488,11 +495,124 @@ async fn execute_sync_queue(
             }
         }
     }
+    for operation in upload_operations {
+        match upload_operation(
+            &store,
+            &database,
+            &profile,
+            endpoint,
+            shared_secret,
+            &remote_manifest,
+            &operation,
+        )
+        .await
+        {
+            Ok(result) => {
+                completed = completed.saturating_add(1);
+                results.push(result);
+            }
+            Err(error) => {
+                failed = failed.saturating_add(1);
+                database
+                    .mark_sync_operation_failed(&operation.id, &error.to_string())
+                    .await?;
+                results.push(TransferOperationResult {
+                    operation_id: operation.id,
+                    path: operation.path,
+                    status: "failed",
+                    size_bytes: operation.local_size_bytes.unwrap_or_default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
 
     print_json(&ExecuteSyncQueueOutput {
         completed,
         failed,
         results,
+    })
+}
+
+async fn upload_operation(
+    store: &FolderStore,
+    database: &StateDatabase,
+    profile: &LocalDeviceProfile,
+    endpoint: &str,
+    shared_secret: &str,
+    remote_manifest: &FolderManifest,
+    operation: &SyncOperationRecord,
+) -> Result<TransferOperationResult, TransferError> {
+    if remote_manifest.files.iter().any(|file| {
+        file.path == operation.path && file.sync_state == syncer_core::FileSyncState::LocalAvailable
+    }) {
+        return Err(TransferError::RemoteTargetExists);
+    }
+    let local_file = database
+        .list_files()
+        .await?
+        .into_iter()
+        .find(|file| file.path == operation.path)
+        .ok_or(TransferError::LocalFileMissing)?;
+    if local_file.kind != FileKind::File {
+        return Err(TransferError::LocalPathIsNotFile);
+    }
+    let expected_hash = operation
+        .local_content_hash
+        .as_deref()
+        .or(local_file.content_hash.as_deref())
+        .ok_or(TransferError::LocalHashMissing)?;
+    if local_file.content_hash.as_deref() != Some(expected_hash) {
+        return Err(TransferError::LocalFileChanged);
+    }
+    if operation
+        .local_size_bytes
+        .is_some_and(|size_bytes| size_bytes != local_file.size_bytes)
+    {
+        return Err(TransferError::LocalFileChanged);
+    }
+
+    let target = store.root().join(operation.path.as_path());
+    let bytes = tokio::fs::read(&target)
+        .await
+        .map_err(|source| TransferError::Filesystem {
+            path: target,
+            source,
+        })?;
+    let uploaded_size = u64::try_from(bytes.len()).map_err(|_| TransferError::FileSizeOverflow)?;
+    if uploaded_size != local_file.size_bytes {
+        return Err(TransferError::SizeMismatch {
+            expected: local_file.size_bytes,
+            actual: uploaded_size,
+        });
+    }
+    let content_hash = ContentHash::from_bytes(&bytes);
+    if content_hash.as_hex() != expected_hash {
+        return Err(TransferError::HashMismatch);
+    }
+    let response = peer_client::put_file(
+        endpoint,
+        &profile.device_id.to_string(),
+        shared_secret,
+        &operation.path,
+        expected_hash,
+        &bytes,
+    )?;
+    if !response.accepted
+        || response.path != operation.path
+        || response.size_bytes != uploaded_size
+        || response.content_hash != expected_hash
+    {
+        return Err(TransferError::UploadRejected);
+    }
+
+    database.mark_sync_operation_done(&operation.id).await?;
+    Ok(TransferOperationResult {
+        operation_id: operation.id.clone(),
+        path: operation.path.clone(),
+        status: "done",
+        size_bytes: uploaded_size,
+        error: None,
     })
 }
 
@@ -846,6 +966,14 @@ struct TransferOperationResult {
 
 #[derive(Debug, thiserror::Error)]
 enum TransferError {
+    #[error("local file is missing")]
+    LocalFileMissing,
+    #[error("local path is not a regular file")]
+    LocalPathIsNotFile,
+    #[error("local file hash is missing")]
+    LocalHashMissing,
+    #[error("local file changed after this operation was queued")]
+    LocalFileChanged,
     #[error("remote file is missing")]
     RemoteFileMissing,
     #[error("remote path is not a regular file")]
@@ -854,6 +982,10 @@ enum TransferError {
     RemoteHashMissing,
     #[error("remote file changed after this operation was queued")]
     RemoteFileChanged,
+    #[error("remote target already exists")]
+    RemoteTargetExists,
+    #[error("peer rejected uploaded file")]
+    UploadRejected,
     #[error("local target already exists")]
     LocalTargetExists,
     #[error("downloaded size mismatch: expected {expected}, got {actual}")]

@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 use syncer_core::{
-    FileKind, FileSyncState, FolderManifest, FolderStore, PeerPresence, StateDatabase,
+    ContentHash, FileEntry, FileKind, FileSyncState, FileVersion, FolderManifest, FolderStore,
+    PeerPresence, RelativePath, StateDatabase,
 };
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,7 +16,7 @@ use crate::peer_store::PeerStoreDocument;
 use crate::profile::LocalDeviceProfile;
 use crate::request_signing::verify_request_signature;
 
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -94,6 +95,23 @@ async fn route_request(
                 read_shared_file(&config.folder_path, &config.profile, &relative_path).await?;
             Ok(binary_response(200, "application/octet-stream", &bytes))
         }
+        ("PUT", path) if path.starts_with("/file/") => {
+            verify_peer_request(request, &config.peers_path)?;
+            let relative_path = decode_relative_path(path.trim_start_matches("/file/"))
+                .map_err(|_| PeerServerError::InvalidRequest)?;
+            let expected_size = required_u64_header(request, "x-syncer-file-size")?;
+            let expected_hash = required_header(request, "x-syncer-content-hash")?;
+            let response = write_uploaded_file(
+                &config.folder_path,
+                &config.profile,
+                &relative_path,
+                expected_size,
+                expected_hash,
+                &request.body,
+            )
+            .await?;
+            json_response(200, &response)
+        }
         _ => json_response(
             404,
             &ErrorResponse {
@@ -126,6 +144,98 @@ async fn read_shared_file(
         .map_err(|error| PeerServerError::Filesystem {
             path,
             source: error,
+        })
+}
+
+async fn write_uploaded_file(
+    folder_path: &Utf8PathBuf,
+    profile: &LocalDeviceProfile,
+    relative_path: &RelativePath,
+    expected_size: u64,
+    expected_hash: &str,
+    bytes: &[u8],
+) -> Result<UploadFileResponse, PeerServerError> {
+    let actual_size = u64::try_from(bytes.len()).map_err(|_| PeerServerError::FileSizeOverflow)?;
+    if actual_size != expected_size {
+        return Err(PeerServerError::InvalidRequest);
+    }
+    let content_hash = ContentHash::from_bytes(bytes);
+    if content_hash.as_hex() != expected_hash {
+        return Err(PeerServerError::HashMismatch);
+    }
+
+    let store = FolderStore::new(folder_path.clone());
+    let target = folder_path.join(relative_path.as_path());
+    if tokio::fs::try_exists(&target)
+        .await
+        .map_err(|source| PeerServerError::Filesystem {
+            path: target.clone(),
+            source,
+        })?
+    {
+        return Err(PeerServerError::Conflict);
+    }
+
+    publish_uploaded_file(&store, relative_path, bytes).await?;
+    store.read().await?;
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    database
+        .upsert_file(&FileEntry {
+            path: relative_path.clone(),
+            kind: FileKind::File,
+            size_bytes: actual_size,
+            modified_at: OffsetDateTime::now_utc(),
+            content_hash: Some(content_hash),
+            block_hashes: Vec::new(),
+            version: FileVersion {
+                generation: 1,
+                device_id: profile.device_id,
+            },
+        })
+        .await?;
+
+    Ok(UploadFileResponse {
+        accepted: true,
+        path: relative_path.clone(),
+        size_bytes: actual_size,
+        content_hash: expected_hash.to_owned(),
+    })
+}
+
+async fn publish_uploaded_file(
+    store: &FolderStore,
+    relative_path: &RelativePath,
+    bytes: &[u8],
+) -> Result<(), PeerServerError> {
+    let temporary_dir = store.syncer_dir().join("tmp").join("uploads");
+    tokio::fs::create_dir_all(&temporary_dir)
+        .await
+        .map_err(|source| PeerServerError::Filesystem {
+            path: temporary_dir.clone(),
+            source,
+        })?;
+    let temporary = temporary_dir.join(format!("{}.part", uuid::Uuid::now_v7()));
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(|source| PeerServerError::Filesystem {
+            path: temporary.clone(),
+            source,
+        })?;
+
+    let target = store.root().join(relative_path.as_path());
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| PeerServerError::Filesystem {
+                path: parent.to_owned(),
+                source,
+            })?;
+    }
+    tokio::fs::rename(&temporary, &target)
+        .await
+        .map_err(|source| PeerServerError::Filesystem {
+            path: target,
+            source,
         })
 }
 
@@ -272,6 +382,23 @@ fn verify_peer_request(
     Ok(())
 }
 
+fn required_header<'request>(
+    request: &'request HttpRequest,
+    name: &str,
+) -> Result<&'request str, PeerServerError> {
+    request
+        .headers
+        .get(name)
+        .map(String::as_str)
+        .ok_or(PeerServerError::InvalidRequest)
+}
+
+fn required_u64_header(request: &HttpRequest, name: &str) -> Result<u64, PeerServerError> {
+    required_header(request, name)?
+        .parse::<u64>()
+        .map_err(|_| PeerServerError::InvalidRequest)
+}
+
 fn json_response<T: Serialize>(status: u16, value: &T) -> Result<Vec<u8>, PeerServerError> {
     let body = serde_json::to_vec(value)?;
     Ok(binary_response(status, "application/json", &body))
@@ -283,6 +410,7 @@ fn binary_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        409 => "Conflict",
         413 => "Payload Too Large",
         _ => "Internal Server Error",
     };
@@ -301,9 +429,13 @@ fn error_response(error: &PeerServerError) -> Vec<u8> {
         | PeerServerError::PeerStore(_)
         | PeerServerError::Signing(_) => 401,
         PeerServerError::NotFound => 404,
+        PeerServerError::Conflict => 409,
         PeerServerError::RequestTooLarge => 413,
         PeerServerError::RequestTimeout => 408,
-        PeerServerError::InvalidRequest | PeerServerError::Json(_) => 400,
+        PeerServerError::InvalidRequest
+        | PeerServerError::HashMismatch
+        | PeerServerError::FileSizeOverflow
+        | PeerServerError::Json(_) => 400,
         PeerServerError::Io(_) | PeerServerError::Core(_) | PeerServerError::Filesystem { .. } => {
             500
         }
@@ -347,6 +479,14 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct UploadFileResponse {
+    pub accepted: bool,
+    pub path: RelativePath,
+    pub size_bytes: u64,
+    pub content_hash: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PeerServerError {
     #[error("I/O error: {0}")]
@@ -368,6 +508,12 @@ pub enum PeerServerError {
     RequestTimeout,
     #[error("not found")]
     NotFound,
+    #[error("target already exists")]
+    Conflict,
+    #[error("content hash does not match body")]
+    HashMismatch,
+    #[error("file size exceeded supported range")]
+    FileSizeOverflow,
     #[error("unauthorized peer request")]
     Unauthorized,
     #[error("{0}")]
@@ -383,6 +529,9 @@ impl PeerServerError {
             Self::RequestTooLarge => "request_too_large",
             Self::RequestTimeout => "request_timeout",
             Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::HashMismatch => "hash_mismatch",
+            Self::FileSizeOverflow => "file_size_overflow",
             Self::Unauthorized | Self::PeerStore(_) | Self::Signing(_) => "unauthorized",
             Self::Io(_) | Self::Core(_) | Self::Filesystem { .. } => "internal_error",
         }
@@ -394,11 +543,13 @@ impl PeerServerError {
 mod tests {
     use std::fs;
 
-    use syncer_core::{FolderMode, FolderSizeLimit, LinuxFolderScanner, RelativePath};
+    use syncer_core::{
+        ContentHash, FolderMode, FolderSizeLimit, LinuxFolderScanner, RelativePath, StateDatabase,
+    };
 
     use crate::profile::LocalDeviceProfile;
 
-    use super::read_shared_file;
+    use super::{PeerServerError, read_shared_file, write_uploaded_file};
 
     #[tokio::test]
     async fn reads_only_indexed_shared_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -435,6 +586,55 @@ mod tests {
 
         assert_eq!(bytes, b"hello peer");
         assert!(missing.is_err());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_uploaded_file_and_rejects_existing_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("syncer-peer-upload-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&root)?;
+
+        let folder = syncer_core::FolderStore::from_std_path(&root)?;
+        folder
+            .initialize(
+                "Peer Upload Test".to_owned(),
+                FolderMode::Bidirectional,
+                FolderSizeLimit::new(1024 * 1024, 80)?,
+                Vec::new(),
+            )
+            .await?;
+        let profile = LocalDeviceProfile::create("peer".to_owned())?;
+        let body = b"uploaded body";
+        let hash = ContentHash::from_bytes(body);
+
+        let response = write_uploaded_file(
+            &folder.root().to_owned(),
+            &profile,
+            &RelativePath::parse("incoming/file.txt")?,
+            body.len() as u64,
+            hash.as_hex(),
+            body,
+        )
+        .await?;
+        let duplicate = write_uploaded_file(
+            &folder.root().to_owned(),
+            &profile,
+            &RelativePath::parse("incoming/file.txt")?,
+            body.len() as u64,
+            hash.as_hex(),
+            body,
+        )
+        .await;
+        let database = StateDatabase::open(&folder.state_db_path()).await?;
+        let files = database.list_files().await?;
+
+        assert!(response.accepted);
+        assert_eq!(fs::read(root.join("incoming/file.txt"))?, body);
+        assert_eq!(files.len(), 1);
+        assert!(matches!(duplicate, Err(PeerServerError::Conflict)));
         fs::remove_dir_all(root).ok();
         Ok(())
     }
