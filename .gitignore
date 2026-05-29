@@ -22,6 +22,7 @@ apps/android/build/
 apps/android/**/build/
 
 # Tauri build output.
+apps/linux-tauri/src-tauri/gen/
 apps/linux-tauri/src-tauri/target/
 apps/linux-tauri/dist/
 
