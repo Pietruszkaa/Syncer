@@ -18,3 +18,9 @@ Non-responsibilities:
 - cloud account management
 
 The MVP must use only user-selected folders.
+
+## Current Scaffold
+
+- `app/src/main/kotlin/dev/syncer/ui/SyncerUiModels.kt` defines cross-platform screen state.
+- `app/src/main/kotlin/dev/syncer/ui/SyncerAgentBridge.kt` defines the Android boundary to Rust/agent work.
+- `app/src/main/kotlin/dev/syncer/ui/SyncerReducers.kt` keeps screen updates testable before Compose is added.

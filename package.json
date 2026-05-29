@@ -1,0 +1,8 @@
+{
+  "name": "syncer-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:ui": "node --test apps/shared/test/*.test.js apps/linux-tauri/test/*.test.js"
+  }
+}

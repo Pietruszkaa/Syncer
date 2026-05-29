@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Syncer</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main id="app" class="shell" aria-label="Syncer">
+      <aside class="sidebar" aria-label="Folders">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">S</span>
+          <div>
+            <h1>Syncer</h1>
+            <p>Local devices</p>
+          </div>
+        </div>
+        <div id="folder-list" class="folder-list"></div>
+        <button id="add-folder" class="primary-button" type="button">Add folder</button>
+      </aside>
+
+      <section class="workspace" aria-live="polite">
+        <header class="topbar">
+          <div>
+            <p id="peer-state" class="eyebrow">Peer online</p>
+            <h2 id="folder-title">Documents</h2>
+          </div>
+          <div class="topbar-actions">
+            <button id="sync-now" class="icon-button" type="button" title="Sync now" aria-label="Sync now">↻</button>
+            <button id="settings" class="icon-button" type="button" title="Settings" aria-label="Settings">⚙</button>
+          </div>
+        </header>
+
+        <section class="status-grid" aria-label="Folder status">
+          <div class="metric">
+            <span>Used</span>
+            <strong id="used-bytes">0 B</strong>
+          </div>
+          <div class="metric">
+            <span>Files</span>
+            <strong id="indexed-files">0</strong>
+          </div>
+          <div class="metric">
+            <span>Pending</span>
+            <strong id="pending-count">0</strong>
+          </div>
+          <div class="metric">
+            <span>Needs decision</span>
+            <strong id="blocked-count">0</strong>
+          </div>
+        </section>
+
+        <section class="panel" aria-label="Operations">
+          <div class="section-header">
+            <h3>Operations</h3>
+            <div class="segmented" role="tablist" aria-label="Operation filter">
+              <button class="segment active" type="button">All</button>
+              <button class="segment" type="button">Blocked</button>
+              <button class="segment" type="button">Failed</button>
+            </div>
+          </div>
+          <div id="operation-list" class="operation-list"></div>
+        </section>
+
+        <section class="panel compact" aria-label="Folder settings">
+          <div class="section-header">
+            <h3>Folder settings</h3>
+          </div>
+          <div id="folder-settings" class="settings-grid"></div>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
