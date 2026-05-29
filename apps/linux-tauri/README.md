@@ -25,5 +25,6 @@ The UI communicates with the local agent through restricted IPC or localhost wit
 
 - `src/index.html` is the first dashboard surface.
 - `src/app.js` renders a local snapshot and is ready to swap in a Tauri command adapter.
+- `src/agent-adapter.js` defines the Tauri IPC command boundary and local development fallback.
 - `src/view-model.js` maps shared contract data into Linux dashboard state.
-- `test/view-model.test.js` validates the view model with Node's built-in test runner.
+- `test/*.test.js` validates the adapter and view model with Node's built-in test runner.
