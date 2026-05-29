@@ -23,11 +23,12 @@ pub use model::{
 };
 pub use planning::{
     ChangeClassification, FilePresence, SyncAction, SyncPlan, SyncPlanEntry, SyncPlanSummary,
-    classify_file_presence, plan_manifest_sync,
+    classify_file_presence, plan_manifest_sync, plan_manifest_sync_for_mode,
 };
 pub use scanner::{LinuxFolderScanner, ScanSummary};
 pub use security::{PairingTicket, PeerPresence, PublicKeyBytes};
 pub use state_db::{
-    FileRecord, FileSyncState, FolderManifest, FolderStatus, QueueStatus, SkippedFileRecord,
-    SkippedReason, StateDatabase, SyncOperationKind, SyncOperationRecord, SyncOperationStatus,
+    FileRecord, FileSyncState, FolderManifest, FolderStatus, QueueStatus, RetryFailedSummary,
+    SkippedFileRecord, SkippedReason, StateDatabase, SyncOperationKind, SyncOperationRecord,
+    SyncOperationStatus,
 };

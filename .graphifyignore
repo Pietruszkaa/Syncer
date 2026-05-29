@@ -7,6 +7,7 @@
 *.log
 .DS_Store
 .codex
+docs/
 
 # Local Syncer runtime state.
 .syncer-local/

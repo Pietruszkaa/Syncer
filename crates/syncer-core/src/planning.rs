@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::FileEntry;
+use crate::model::FolderMode;
 use crate::state_db::{FileRecord, FileSyncState, FolderManifest};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -86,6 +87,7 @@ pub enum SyncAction {
     Conflict,
     LocalMissingUnsynchronized,
     RemoteMissingUnsynchronized,
+    ModeBlocked,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -96,10 +98,20 @@ pub struct SyncPlanSummary {
     pub conflicts: u64,
     pub local_missing_unsynchronized: u64,
     pub remote_missing_unsynchronized: u64,
+    pub mode_blocked: u64,
 }
 
 #[must_use]
 pub fn plan_manifest_sync(local: &FolderManifest, remote: &FolderManifest) -> SyncPlan {
+    plan_manifest_sync_for_mode(local, remote, FolderMode::Bidirectional)
+}
+
+#[must_use]
+pub fn plan_manifest_sync_for_mode(
+    local: &FolderManifest,
+    remote: &FolderManifest,
+    mode: FolderMode,
+) -> SyncPlan {
     let local_by_path = files_by_path(&local.files);
     let remote_by_path = files_by_path(&remote.files);
     let paths = local_by_path
@@ -118,12 +130,27 @@ pub fn plan_manifest_sync(local: &FolderManifest, remote: &FolderManifest) -> Sy
     for path in paths {
         let local_file = local_by_path.get(&path);
         let remote_file = remote_by_path.get(&path);
-        let entry = plan_path(&path, local_file, remote_file);
+        let entry = apply_folder_mode(plan_path(&path, local_file, remote_file), mode);
         increment_summary(&mut plan.summary, entry.action);
         plan.entries.push(entry);
     }
 
     plan
+}
+
+fn apply_folder_mode(mut entry: SyncPlanEntry, mode: FolderMode) -> SyncPlanEntry {
+    let blocked = match (mode, entry.action) {
+        (FolderMode::UploadOnly, SyncAction::DownloadFromRemote) => Some("folder is upload-only"),
+        (FolderMode::DownloadOnly, SyncAction::UploadToRemote) => Some("folder is download-only"),
+        _ => None,
+    };
+
+    if let Some(reason) = blocked {
+        entry.action = SyncAction::ModeBlocked;
+        reason.clone_into(&mut entry.reason);
+    }
+
+    entry
 }
 
 fn files_by_path(files: &[FileRecord]) -> BTreeMap<String, &FileRecord> {
@@ -282,6 +309,9 @@ fn increment_summary(summary: &mut SyncPlanSummary, action: SyncAction) {
             summary.remote_missing_unsynchronized =
                 summary.remote_missing_unsynchronized.saturating_add(1);
         }
+        SyncAction::ModeBlocked => {
+            summary.mode_blocked = summary.mode_blocked.saturating_add(1);
+        }
     }
 }
 
@@ -291,7 +321,7 @@ mod tests {
 
     use crate::{
         DeviceId, FileKind, FileRecord, FileSyncState, FolderId, FolderManifest, RelativePath,
-        plan_manifest_sync,
+        plan_manifest_sync, plan_manifest_sync_for_mode,
     };
 
     #[test]
@@ -357,6 +387,45 @@ mod tests {
             plan.entries[0].action,
             crate::SyncAction::LocalMissingUnsynchronized
         );
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_disallowed_folder_mode_actions() -> Result<(), crate::CoreError> {
+        let local = manifest(
+            DeviceId::new(),
+            vec![record(
+                "local-only.txt",
+                10,
+                "local",
+                FileSyncState::LocalAvailable,
+            )?],
+        );
+        let remote = manifest(
+            DeviceId::new(),
+            vec![record(
+                "remote-only.txt",
+                10,
+                "remote",
+                FileSyncState::LocalAvailable,
+            )?],
+        );
+
+        let upload_only =
+            plan_manifest_sync_for_mode(&local, &remote, crate::FolderMode::UploadOnly);
+        let download_only =
+            plan_manifest_sync_for_mode(&local, &remote, crate::FolderMode::DownloadOnly);
+
+        assert_eq!(upload_only.summary.upload_to_remote, 1);
+        assert_eq!(upload_only.summary.mode_blocked, 1);
+        assert!(upload_only.entries.iter().any(|entry| {
+            entry.path == "remote-only.txt" && entry.action == crate::SyncAction::ModeBlocked
+        }));
+        assert_eq!(download_only.summary.download_from_remote, 1);
+        assert_eq!(download_only.summary.mode_blocked, 1);
+        assert!(download_only.entries.iter().any(|entry| {
+            entry.path == "local-only.txt" && entry.action == crate::SyncAction::ModeBlocked
+        }));
         Ok(())
     }
 

@@ -14,7 +14,7 @@ use serde::Serialize;
 use syncer_core::{
     ContentHash, DEFAULT_FOLDER_SIZE_LIMIT_BYTES, FileEntry, FileKind, FileVersion, FolderManifest,
     FolderMode, FolderSizeLimit, FolderStore, LinuxFolderScanner, PeerPresence, PendingTransfer,
-    RelativePath, StateDatabase, SyncOperationRecord, plan_manifest_sync,
+    RelativePath, StateDatabase, SyncOperationRecord, plan_manifest_sync_for_mode,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -129,6 +129,12 @@ enum Command {
     QueueStatus {
         #[arg(long)]
         path: Utf8PathBuf,
+    },
+    RetryFailed {
+        #[arg(long)]
+        path: Utf8PathBuf,
+        #[arg(long)]
+        remote_device_id: Option<String>,
     },
     ExecuteSyncQueue {
         #[arg(long)]
@@ -255,6 +261,10 @@ async fn main() -> Result<(), AgentError> {
             device_config,
         } => enqueue_sync_plan(path, &endpoint, &shared_secret, &device_config).await,
         Command::QueueStatus { path } => queue_status(path).await,
+        Command::RetryFailed {
+            path,
+            remote_device_id,
+        } => retry_failed(path, remote_device_id.as_deref()).await,
         Command::ExecuteSyncQueue {
             path,
             endpoint,
@@ -438,6 +448,16 @@ async fn queue_status(path: Utf8PathBuf) -> Result<(), AgentError> {
     print_json(&QueueStatusOutput { status, operations })
 }
 
+async fn retry_failed(path: Utf8PathBuf, remote_device_id: Option<&str>) -> Result<(), AgentError> {
+    let store = FolderStore::new(path);
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    let summary = database
+        .retry_failed_sync_operations(remote_device_id)
+        .await?;
+
+    print_json(&summary)
+}
+
 async fn execute_sync_queue(
     path: Utf8PathBuf,
     endpoint: &str,
@@ -465,6 +485,7 @@ async fn execute_sync_queue(
     let mut failed = 0_u64;
 
     for operation in download_operations {
+        database.mark_sync_operation_started(&operation.id).await?;
         match download_operation(
             &store,
             &database,
@@ -496,6 +517,7 @@ async fn execute_sync_queue(
         }
     }
     for operation in upload_operations {
+        database.mark_sync_operation_started(&operation.id).await?;
         match upload_operation(
             &store,
             &database,
@@ -612,10 +634,13 @@ async fn build_sync_plan(
     let scanner = LinuxFolderScanner::new(path.clone(), profile.device_id);
     scanner.scan_into(&database).await?;
 
-    let local_manifest = load_manifest(path, &profile).await?;
+    let folder = store.read().await?;
+    let local_manifest = database
+        .export_manifest(folder.folder.id, profile.device_id)
+        .await?;
     let remote_manifest =
         peer_client::fetch_manifest(endpoint, &profile.device_id.to_string(), shared_secret)?;
-    let plan = plan_manifest_sync(&local_manifest, &remote_manifest);
+    let plan = plan_manifest_sync_for_mode(&local_manifest, &remote_manifest, folder.folder.mode);
 
     Ok((plan, database))
 }

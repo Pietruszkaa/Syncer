@@ -11,7 +11,7 @@ use crate::ids::{DeviceId, FolderId};
 use crate::manifest::{ContentHash, FileEntry, FileKind, RelativePath};
 use crate::{SyncAction, SyncPlan};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct StateDatabase {
@@ -350,7 +350,8 @@ impl StateDatabase {
             r"
             SELECT id, path, kind, status, reason, local_size_bytes, remote_size_bytes,
                    local_content_hash, remote_content_hash, remote_device_id,
-                   last_error, created_at_unix, updated_at_unix
+                   last_error, retry_count, started_at_unix, finished_at_unix,
+                   created_at_unix, updated_at_unix
             FROM sync_operations
             ORDER BY created_at_unix, path
             ",
@@ -404,7 +405,8 @@ impl StateDatabase {
             r"
             SELECT id, path, kind, status, reason, local_size_bytes, remote_size_bytes,
                    local_content_hash, remote_content_hash, remote_device_id,
-                   last_error, created_at_unix, updated_at_unix
+                   last_error, retry_count, started_at_unix, finished_at_unix,
+                   created_at_unix, updated_at_unix
             FROM sync_operations
             WHERE remote_device_id = ?1
               AND kind = ?2
@@ -432,6 +434,28 @@ impl StateDatabase {
             .await
     }
 
+    /// Marks a queued operation as started.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the update.
+    pub async fn mark_sync_operation_started(&self, operation_id: &str) -> CoreResult<()> {
+        sqlx::query(
+            r"
+            UPDATE sync_operations
+            SET last_error = NULL,
+                started_at_unix = unixepoch(),
+                finished_at_unix = NULL,
+                updated_at_unix = unixepoch()
+            WHERE id = ?1
+            ",
+        )
+        .bind(operation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Marks a queued operation as failed and stores the public failure reason.
     ///
     /// # Errors
@@ -446,6 +470,43 @@ impl StateDatabase {
             .await
     }
 
+    /// Returns failed transfer operations to pending state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the update.
+    pub async fn retry_failed_sync_operations(
+        &self,
+        remote_device_id: Option<&str>,
+    ) -> CoreResult<RetryFailedSummary> {
+        let mut query = String::from(
+            r"
+            UPDATE sync_operations
+            SET status = 'pending',
+                last_error = NULL,
+                retry_count = retry_count + 1,
+                started_at_unix = NULL,
+                finished_at_unix = NULL,
+                updated_at_unix = unixepoch()
+            WHERE status = 'failed'
+              AND kind IN ('upload_to_remote', 'download_from_remote')
+            ",
+        );
+        if remote_device_id.is_some() {
+            query.push_str(" AND remote_device_id = ?1");
+        }
+
+        let mut statement = sqlx::query(&query);
+        if let Some(remote_device_id) = remote_device_id {
+            statement = statement.bind(remote_device_id);
+        }
+        let result = statement.execute(&self.pool).await?;
+        Ok(RetryFailedSummary {
+            retried: result.rows_affected(),
+            queue: self.queue_status().await?,
+        })
+    }
+
     async fn update_sync_operation_status(
         &self,
         operation_id: &str,
@@ -457,6 +518,7 @@ impl StateDatabase {
             UPDATE sync_operations
             SET status = ?2,
                 last_error = ?3,
+                finished_at_unix = unixepoch(),
                 updated_at_unix = unixepoch()
             WHERE id = ?1
             ",
@@ -514,6 +576,9 @@ impl StateDatabase {
                 SyncOperationKind::RepairRemoteMissing => {
                     status.repair_remote_missing = status.repair_remote_missing.saturating_add(1);
                 }
+                SyncOperationKind::ModeBlocked => {
+                    status.mode_blocked = status.mode_blocked.saturating_add(1);
+                }
             }
         }
 
@@ -541,6 +606,15 @@ impl StateDatabase {
         ensure_column(&self.pool, "sync_operations", "local_content_hash", "TEXT").await?;
         ensure_column(&self.pool, "sync_operations", "remote_content_hash", "TEXT").await?;
         ensure_column(&self.pool, "sync_operations", "last_error", "TEXT").await?;
+        ensure_column(
+            &self.pool,
+            "sync_operations",
+            "retry_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        ensure_column(&self.pool, "sync_operations", "started_at_unix", "INTEGER").await?;
+        ensure_column(&self.pool, "sync_operations", "finished_at_unix", "INTEGER").await?;
         sqlx::query(
             r"
             INSERT INTO metadata (key, value)
@@ -628,7 +702,8 @@ impl StateDatabase {
                   'download_from_remote',
                   'resolve_conflict',
                   'repair_local_missing',
-                  'repair_remote_missing'
+                  'repair_remote_missing',
+                  'mode_blocked'
                 )
               ),
               status TEXT NOT NULL CHECK (
@@ -641,6 +716,9 @@ impl StateDatabase {
               remote_content_hash TEXT,
               remote_device_id TEXT NOT NULL,
               last_error TEXT,
+              retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+              started_at_unix INTEGER,
+              finished_at_unix INTEGER,
               created_at_unix INTEGER NOT NULL DEFAULT (unixepoch()),
               updated_at_unix INTEGER NOT NULL DEFAULT (unixepoch())
             )
@@ -749,6 +827,11 @@ pub struct SyncOperationRecord {
     pub remote_content_hash: Option<String>,
     pub remote_device_id: String,
     pub last_error: Option<String>,
+    pub retry_count: u64,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub finished_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -763,6 +846,7 @@ pub enum SyncOperationKind {
     ResolveConflict,
     RepairLocalMissing,
     RepairRemoteMissing,
+    ModeBlocked,
 }
 
 impl SyncOperationKind {
@@ -773,6 +857,7 @@ impl SyncOperationKind {
             "resolve_conflict" => Ok(Self::ResolveConflict),
             "repair_local_missing" => Ok(Self::RepairLocalMissing),
             "repair_remote_missing" => Ok(Self::RepairRemoteMissing),
+            "mode_blocked" => Ok(Self::ModeBlocked),
             other => Err(CoreError::StateDatabase(format!(
                 "unknown sync operation kind {other}"
             ))),
@@ -786,6 +871,7 @@ impl SyncOperationKind {
             Self::ResolveConflict => "resolve_conflict",
             Self::RepairLocalMissing => "repair_local_missing",
             Self::RepairRemoteMissing => "repair_remote_missing",
+            Self::ModeBlocked => "mode_blocked",
         }
     }
 }
@@ -834,6 +920,13 @@ pub struct QueueStatus {
     pub resolve_conflict: u64,
     pub repair_local_missing: u64,
     pub repair_remote_missing: u64,
+    pub mode_blocked: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetryFailedSummary {
+    pub retried: u64,
+    pub queue: QueueStatus,
 }
 
 fn row_to_file_record(row: &sqlx::sqlite::SqliteRow) -> CoreResult<FileRecord> {
@@ -897,6 +990,9 @@ fn row_to_sync_operation(row: &sqlx::sqlite::SqliteRow) -> CoreResult<SyncOperat
     let remote_content_hash: Option<String> = row.try_get("remote_content_hash")?;
     let remote_device_id: String = row.try_get("remote_device_id")?;
     let last_error: Option<String> = row.try_get("last_error")?;
+    let retry_count: i64 = row.try_get("retry_count")?;
+    let started_at_unix: Option<i64> = row.try_get("started_at_unix")?;
+    let finished_at_unix: Option<i64> = row.try_get("finished_at_unix")?;
     let created_at_unix: i64 = row.try_get("created_at_unix")?;
     let updated_at_unix: i64 = row.try_get("updated_at_unix")?;
 
@@ -912,6 +1008,10 @@ fn row_to_sync_operation(row: &sqlx::sqlite::SqliteRow) -> CoreResult<SyncOperat
         remote_content_hash,
         remote_device_id,
         last_error,
+        retry_count: u64::try_from(retry_count)
+            .map_err(|_| CoreError::StateDatabase("negative retry count".to_owned()))?,
+        started_at: optional_unix_timestamp(started_at_unix)?,
+        finished_at: optional_unix_timestamp(finished_at_unix)?,
         created_at: unix_timestamp(created_at_unix)?,
         updated_at: unix_timestamp(updated_at_unix)?,
     })
@@ -940,6 +1040,9 @@ fn operation_for_action(action: SyncAction) -> Option<(SyncOperationKind, SyncOp
             SyncOperationKind::RepairRemoteMissing,
             SyncOperationStatus::Blocked,
         )),
+        SyncAction::ModeBlocked => {
+            Some((SyncOperationKind::ModeBlocked, SyncOperationStatus::Blocked))
+        }
     }
 }
 
@@ -958,6 +1061,10 @@ fn optional_u64(value: Option<i64>) -> CoreResult<Option<u64>> {
 fn unix_timestamp(timestamp: i64) -> CoreResult<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(timestamp)
         .map_err(|error| CoreError::StateDatabase(error.to_string()))
+}
+
+fn optional_unix_timestamp(timestamp: Option<i64>) -> CoreResult<Option<OffsetDateTime>> {
+    timestamp.map(unix_timestamp).transpose()
 }
 
 async fn ensure_column(
@@ -1055,6 +1162,7 @@ mod tests {
                 plan_entry("upload.txt", SyncAction::UploadToRemote),
                 plan_entry("download.txt", SyncAction::DownloadFromRemote),
                 plan_entry("conflict.txt", SyncAction::Conflict),
+                plan_entry("mode.txt", SyncAction::ModeBlocked),
             ],
             summary: SyncPlanSummary::default(),
         };
@@ -1062,10 +1170,11 @@ mod tests {
         let status = database.enqueue_sync_plan(&plan).await?;
         let operations = database.list_sync_operations().await?;
 
-        assert_eq!(status.total, 3);
+        assert_eq!(status.total, 4);
         assert_eq!(status.pending, 2);
-        assert_eq!(status.blocked, 1);
-        assert_eq!(operations.len(), 3);
+        assert_eq!(status.blocked, 2);
+        assert_eq!(status.mode_blocked, 1);
+        assert_eq!(operations.len(), 4);
         assert!(
             operations
                 .iter()
@@ -1078,6 +1187,12 @@ mod tests {
         assert!(operations.iter().any(|operation| operation.kind
             == SyncOperationKind::ResolveConflict
             && operation.status == SyncOperationStatus::Blocked));
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation.kind == SyncOperationKind::ModeBlocked
+                    && operation.status == SyncOperationStatus::Blocked)
+        );
         Ok(())
     }
 
@@ -1176,6 +1291,7 @@ mod tests {
 
         database.enqueue_sync_plan(&plan).await?;
         let operation = database.list_sync_operations().await?.remove(0);
+        database.mark_sync_operation_started(&operation.id).await?;
         database
             .mark_sync_operation_failed(&operation.id, "hash mismatch")
             .await?;
@@ -1183,6 +1299,52 @@ mod tests {
 
         assert_eq!(operation.status, SyncOperationStatus::Failed);
         assert_eq!(operation.last_error, Some("hash mismatch".to_owned()));
+        assert!(operation.started_at.is_some());
+        assert!(operation.finished_at.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retries_failed_transfer_operations() -> Result<(), crate::CoreError> {
+        let database = StateDatabase::in_memory().await?;
+        let remote_device_id = DeviceId::new().to_string();
+        let plan = SyncPlan {
+            local_device_id: DeviceId::new().to_string(),
+            remote_device_id: remote_device_id.clone(),
+            entries: vec![
+                plan_entry("download.txt", SyncAction::DownloadFromRemote),
+                plan_entry("upload.txt", SyncAction::UploadToRemote),
+                plan_entry("conflict.txt", SyncAction::Conflict),
+            ],
+            summary: SyncPlanSummary::default(),
+        };
+
+        database.enqueue_sync_plan(&plan).await?;
+        for operation in database.list_sync_operations().await? {
+            database.mark_sync_operation_started(&operation.id).await?;
+            database
+                .mark_sync_operation_failed(&operation.id, "network failed")
+                .await?;
+        }
+        let summary = database
+            .retry_failed_sync_operations(Some(&remote_device_id))
+            .await?;
+        let operations = database.list_sync_operations().await?;
+
+        assert_eq!(summary.retried, 2);
+        assert_eq!(summary.queue.pending, 2);
+        assert_eq!(summary.queue.failed, 1);
+        assert!(operations.iter().any(|operation| operation.kind
+            == SyncOperationKind::ResolveConflict
+            && operation.status == SyncOperationStatus::Failed
+            && operation.last_error == Some("network failed".to_owned())));
+        assert!(operations.iter().any(|operation| operation.kind
+            == SyncOperationKind::DownloadFromRemote
+            && operation.status == SyncOperationStatus::Pending
+            && operation.last_error.is_none()
+            && operation.retry_count == 1
+            && operation.started_at.is_none()
+            && operation.finished_at.is_none()));
         Ok(())
     }
 
