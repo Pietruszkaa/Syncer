@@ -31,6 +31,7 @@ pub fn post_presence(
         device_id,
         shared_secret_hex,
         Some(presence),
+        &[],
     )
 }
 
@@ -46,6 +47,7 @@ pub fn fetch_manifest(
         device_id,
         shared_secret_hex,
         None,
+        &[],
     )
 }
 
@@ -136,6 +138,29 @@ pub fn put_file_from_path(
     parse_json_response(&response)
 }
 
+pub fn delete_file(
+    endpoint: &str,
+    device_id: &str,
+    shared_secret_hex: &str,
+    path: &RelativePath,
+    content_hash: &str,
+    size_bytes: u64,
+) -> Result<DeleteFileResponse, PeerClientError> {
+    let request_path = format!("/file/{}", encode_relative_path(path));
+    request_json::<(), DeleteFileResponse>(
+        "DELETE",
+        endpoint,
+        &request_path,
+        device_id,
+        shared_secret_hex,
+        None,
+        &[
+            ("x-syncer-content-hash".to_owned(), content_hash.to_owned()),
+            ("x-syncer-file-size".to_owned(), size_bytes.to_string()),
+        ],
+    )
+}
+
 fn request_json<T: Serialize, R: DeserializeOwned>(
     method: &str,
     endpoint: &str,
@@ -143,6 +168,7 @@ fn request_json<T: Serialize, R: DeserializeOwned>(
     device_id: &str,
     shared_secret_hex: &str,
     body: Option<&T>,
+    extra_headers: &[(String, String)],
 ) -> Result<R, PeerClientError> {
     let body = match body {
         Some(value) => serde_json::to_vec(value)?,
@@ -155,7 +181,7 @@ fn request_json<T: Serialize, R: DeserializeOwned>(
         device_id,
         shared_secret_hex,
         body: &body,
-        extra_headers: &[],
+        extra_headers,
         response_limit_bytes: RESPONSE_LIMIT_BYTES as u64,
     })?;
 
@@ -222,6 +248,14 @@ struct PeerRequest<'request> {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct UploadFileResponse {
+    pub accepted: bool,
+    pub path: RelativePath,
+    pub size_bytes: u64,
+    pub content_hash: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DeleteFileResponse {
     pub accepted: bool,
     pub path: RelativePath,
     pub size_bytes: u64,

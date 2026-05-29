@@ -181,6 +181,44 @@ impl StateDatabase {
         rows.iter().map(row_to_file_record).collect()
     }
 
+    /// Marks a known file as intentionally missing on this device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the update.
+    pub async fn mark_file_deleted_locally(&self, path: &RelativePath) -> CoreResult<()> {
+        sqlx::query(
+            r"
+            UPDATE files
+            SET sync_state = 'unsynchronized_local_missing',
+                modified_at_unix = unixepoch()
+            WHERE path = ?1
+            ",
+        )
+        .bind(path.as_path().as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Removes a file from local sync state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the update.
+    pub async fn forget_file(&self, path: &RelativePath) -> CoreResult<()> {
+        sqlx::query(
+            r"
+            DELETE FROM files
+            WHERE path = ?1
+            ",
+        )
+        .bind(path.as_path().as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Records a remote file skipped because the folder size limit would be exceeded.
     ///
     /// # Errors
@@ -505,6 +543,85 @@ impl StateDatabase {
             retried: result.rows_affected(),
             queue: self.queue_status().await?,
         })
+    }
+
+    /// Resolves a blocked operation by turning it into a pending transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the update or the requested resolution is invalid
+    /// for the blocked operation kind.
+    pub async fn resolve_blocked_sync_operation(
+        &self,
+        operation_id: &str,
+        resolution: BlockedOperationResolution,
+    ) -> CoreResult<ResolveOperationSummary> {
+        let operation = self.get_sync_operation(operation_id).await?;
+        if operation.status != SyncOperationStatus::Blocked {
+            return Err(CoreError::StateDatabase(
+                "only blocked operations can be resolved".to_owned(),
+            ));
+        }
+
+        let target_kind = match (operation.kind, resolution) {
+            (
+                SyncOperationKind::ResolveConflict | SyncOperationKind::RepairLocalMissing,
+                BlockedOperationResolution::DownloadFromRemote,
+            ) => SyncOperationKind::DownloadFromRemote,
+            (
+                SyncOperationKind::ResolveConflict | SyncOperationKind::RepairRemoteMissing,
+                BlockedOperationResolution::UploadToRemote,
+            ) => SyncOperationKind::UploadToRemote,
+            _ => {
+                return Err(CoreError::StateDatabase(format!(
+                    "resolution {:?} is not valid for {:?}",
+                    resolution, operation.kind
+                )));
+            }
+        };
+
+        sqlx::query(
+            r"
+            UPDATE sync_operations
+            SET kind = ?2,
+                status = 'pending',
+                reason = ?3,
+                last_error = NULL,
+                started_at_unix = NULL,
+                finished_at_unix = NULL,
+                updated_at_unix = unixepoch()
+            WHERE id = ?1
+            ",
+        )
+        .bind(operation_id)
+        .bind(target_kind.as_str())
+        .bind(resolution.reason())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(ResolveOperationSummary {
+            operation: self.get_sync_operation(operation_id).await?,
+            queue: self.queue_status().await?,
+        })
+    }
+
+    async fn get_sync_operation(&self, operation_id: &str) -> CoreResult<SyncOperationRecord> {
+        let row = sqlx::query(
+            r"
+            SELECT id, path, kind, status, reason, local_size_bytes, remote_size_bytes,
+                   local_content_hash, remote_content_hash, remote_device_id,
+                   last_error, retry_count, started_at_unix, finished_at_unix,
+                   created_at_unix, updated_at_unix
+            FROM sync_operations
+            WHERE id = ?1
+            ",
+        )
+        .bind(operation_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| CoreError::StateDatabase("sync operation not found".to_owned()))?;
+
+        row_to_sync_operation(&row)
     }
 
     async fn update_sync_operation_status(
@@ -929,6 +1046,28 @@ pub struct RetryFailedSummary {
     pub queue: QueueStatus,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedOperationResolution {
+    DownloadFromRemote,
+    UploadToRemote,
+}
+
+impl BlockedOperationResolution {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::DownloadFromRemote => "user selected remote version",
+            Self::UploadToRemote => "user selected local version",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResolveOperationSummary {
+    pub operation: SyncOperationRecord,
+    pub queue: QueueStatus,
+}
+
 fn row_to_file_record(row: &sqlx::sqlite::SqliteRow) -> CoreResult<FileRecord> {
     let path: String = row.try_get("path")?;
     let kind: String = row.try_get("kind")?;
@@ -1093,9 +1232,9 @@ mod tests {
     use time::macros::datetime;
 
     use crate::{
-        ContentHash, DeviceId, FileEntry, FileKind, FileSyncState, FileVersion, PendingTransfer,
-        RelativePath, StateDatabase, SyncAction, SyncOperationKind, SyncOperationStatus, SyncPlan,
-        SyncPlanEntry, SyncPlanSummary,
+        BlockedOperationResolution, ContentHash, DeviceId, FileEntry, FileKind, FileSyncState,
+        FileVersion, PendingTransfer, RelativePath, StateDatabase, SyncAction, SyncOperationKind,
+        SyncOperationStatus, SyncPlan, SyncPlanEntry, SyncPlanSummary,
     };
 
     #[tokio::test]
@@ -1128,6 +1267,29 @@ mod tests {
             FileSyncState::UnsynchronizedLocalMissing
         );
         assert_eq!(status.unsynchronized_local_missing, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn marks_and_forgets_program_deleted_files() -> Result<(), crate::CoreError> {
+        let database = StateDatabase::in_memory().await?;
+        let path = RelativePath::parse("docs/readme.txt")?;
+        database
+            .upsert_file(&test_entry(path.as_path().as_str())?)
+            .await?;
+
+        database.mark_file_deleted_locally(&path).await?;
+        let files = database.list_files().await?;
+
+        assert_eq!(
+            files[0].sync_state,
+            FileSyncState::UnsynchronizedLocalMissing
+        );
+
+        database.forget_file(&path).await?;
+        let files = database.list_files().await?;
+
+        assert!(files.is_empty());
         Ok(())
     }
 
@@ -1345,6 +1507,54 @@ mod tests {
             && operation.retry_count == 1
             && operation.started_at.is_none()
             && operation.finished_at.is_none()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolves_blocked_operations_to_pending_transfers() -> Result<(), crate::CoreError> {
+        let database = StateDatabase::in_memory().await?;
+        let plan = SyncPlan {
+            local_device_id: DeviceId::new().to_string(),
+            remote_device_id: DeviceId::new().to_string(),
+            entries: vec![
+                plan_entry("conflict.txt", SyncAction::Conflict),
+                plan_entry("local-missing.txt", SyncAction::LocalMissingUnsynchronized),
+                plan_entry(
+                    "remote-missing.txt",
+                    SyncAction::RemoteMissingUnsynchronized,
+                ),
+            ],
+            summary: SyncPlanSummary::default(),
+        };
+
+        database.enqueue_sync_plan(&plan).await?;
+        let operations = database.list_sync_operations().await?;
+        let conflict = operations
+            .iter()
+            .find(|operation| operation.kind == SyncOperationKind::ResolveConflict)
+            .ok_or_else(|| crate::CoreError::StateDatabase("conflict operation".to_owned()))?;
+        let local_missing = operations
+            .iter()
+            .find(|operation| operation.kind == SyncOperationKind::RepairLocalMissing)
+            .ok_or_else(|| crate::CoreError::StateDatabase("local missing operation".to_owned()))?;
+
+        let resolved = database
+            .resolve_blocked_sync_operation(
+                &conflict.id,
+                BlockedOperationResolution::UploadToRemote,
+            )
+            .await?;
+        let invalid = database
+            .resolve_blocked_sync_operation(
+                &local_missing.id,
+                BlockedOperationResolution::UploadToRemote,
+            )
+            .await;
+
+        assert_eq!(resolved.operation.kind, SyncOperationKind::UploadToRemote);
+        assert_eq!(resolved.operation.status, SyncOperationStatus::Pending);
+        assert_eq!(resolved.queue.pending, 1);
+        assert!(invalid.is_err());
         Ok(())
     }
 

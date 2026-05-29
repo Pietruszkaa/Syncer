@@ -119,6 +119,22 @@ async fn route_request(
             .await?;
             json_response(200, &response)
         }
+        ("DELETE", path) if path.starts_with("/file/") => {
+            verify_peer_request(request, &config.peers_path)?;
+            let relative_path = decode_relative_path(path.trim_start_matches("/file/"))
+                .map_err(|_| PeerServerError::InvalidRequest)?;
+            let expected_size = required_u64_header(request, "x-syncer-file-size")?;
+            let expected_hash = required_header(request, "x-syncer-content-hash")?;
+            let response = delete_shared_file(
+                &config.folder_path,
+                &config.profile,
+                &relative_path,
+                expected_size,
+                expected_hash,
+            )
+            .await?;
+            json_response(200, &response)
+        }
         _ => json_response(
             404,
             &ErrorResponse {
@@ -200,6 +216,47 @@ async fn write_uploaded_file(
         .await?;
 
     Ok(UploadFileResponse {
+        accepted: true,
+        path: relative_path.clone(),
+        size_bytes: expected_size,
+        content_hash: expected_hash.to_owned(),
+    })
+}
+
+async fn delete_shared_file(
+    folder_path: &Utf8PathBuf,
+    profile: &LocalDeviceProfile,
+    relative_path: &RelativePath,
+    expected_size: u64,
+    expected_hash: &str,
+) -> Result<DeleteFileResponse, PeerServerError> {
+    let manifest = export_manifest(folder_path, profile).await?;
+    let Some(file) = manifest
+        .files
+        .iter()
+        .find(|file| file.path == *relative_path)
+    else {
+        return Err(PeerServerError::NotFound);
+    };
+    if file.kind != FileKind::File || file.sync_state != FileSyncState::LocalAvailable {
+        return Err(PeerServerError::NotFound);
+    }
+    if file.size_bytes != expected_size || file.content_hash.as_deref() != Some(expected_hash) {
+        return Err(PeerServerError::Conflict);
+    }
+
+    let store = FolderStore::new(folder_path.clone());
+    let target = folder_path.join(relative_path.as_path());
+    tokio::fs::remove_file(&target)
+        .await
+        .map_err(|source| PeerServerError::Filesystem {
+            path: target,
+            source,
+        })?;
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    database.forget_file(relative_path).await?;
+
+    Ok(DeleteFileResponse {
         accepted: true,
         path: relative_path.clone(),
         size_bytes: expected_size,
@@ -740,6 +797,14 @@ pub struct UploadFileResponse {
     pub content_hash: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct DeleteFileResponse {
+    pub accepted: bool,
+    pub path: RelativePath,
+    pub size_bytes: u64,
+    pub content_hash: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PeerServerError {
     #[error("I/O error: {0}")]
@@ -802,7 +867,7 @@ mod tests {
 
     use crate::profile::LocalDeviceProfile;
 
-    use super::{FileBody, PeerServerError, shared_file, write_uploaded_file};
+    use super::{FileBody, PeerServerError, delete_shared_file, shared_file, write_uploaded_file};
 
     #[tokio::test]
     async fn reads_only_indexed_shared_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -901,6 +966,45 @@ mod tests {
         assert_eq!(fs::read(root.join("incoming/file.txt"))?, body);
         assert_eq!(files.len(), 1);
         assert!(matches!(duplicate, Err(PeerServerError::Conflict)));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletes_only_matching_indexed_shared_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root =
+            std::env::temp_dir().join(format!("syncer-peer-delete-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(root.join("docs"))?;
+        fs::write(root.join("docs/readme.txt"), b"delete me")?;
+
+        let folder = syncer_core::FolderStore::from_std_path(&root)?;
+        folder
+            .initialize(
+                "Peer Delete Test".to_owned(),
+                FolderMode::Bidirectional,
+                FolderSizeLimit::new(1024 * 1024, 80)?,
+                Vec::new(),
+            )
+            .await?;
+        let profile = LocalDeviceProfile::create("peer".to_owned())?;
+        let database = syncer_core::StateDatabase::open(&folder.state_db_path()).await?;
+        let scanner = LinuxFolderScanner::from_std_path(&root, profile.device_id)?;
+        scanner.scan_into(&database).await?;
+        let path = RelativePath::parse("docs/readme.txt")?;
+        let hash = ContentHash::from_bytes(b"delete me");
+
+        let stale =
+            delete_shared_file(&folder.root().to_owned(), &profile, &path, 9, "stale").await;
+        let deleted =
+            delete_shared_file(&folder.root().to_owned(), &profile, &path, 9, hash.as_hex())
+                .await?;
+        let files = database.list_files().await?;
+
+        assert!(matches!(stale, Err(PeerServerError::Conflict)));
+        assert!(deleted.accepted);
+        assert!(!root.join("docs/readme.txt").exists());
+        assert!(files.is_empty());
         fs::remove_dir_all(root).ok();
         Ok(())
     }

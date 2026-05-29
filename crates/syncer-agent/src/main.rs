@@ -9,12 +9,13 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use camino::Utf8PathBuf;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use syncer_core::{
-    ContentHash, DEFAULT_FOLDER_SIZE_LIMIT_BYTES, FileEntry, FileKind, FileVersion, FolderManifest,
-    FolderMode, FolderSizeLimit, FolderStore, LinuxFolderScanner, PeerPresence, PendingTransfer,
-    RelativePath, StateDatabase, SyncOperationRecord, plan_manifest_sync_for_mode,
+    BlockedOperationResolution, ContentHash, DEFAULT_FOLDER_SIZE_LIMIT_BYTES, DeleteScope,
+    FileEntry, FileKind, FileVersion, FolderManifest, FolderMode, FolderSizeLimit, FolderStore,
+    LinuxFolderScanner, PeerPresence, PendingTransfer, RelativePath, StateDatabase,
+    SyncOperationRecord, plan_manifest_sync_for_mode,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -136,6 +137,28 @@ enum Command {
         #[arg(long)]
         remote_device_id: Option<String>,
     },
+    ResolveBlocked {
+        #[arg(long)]
+        path: Utf8PathBuf,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        action: ResolveActionArg,
+    },
+    DeleteFile {
+        #[arg(long)]
+        path: Utf8PathBuf,
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        scope: DeleteScopeArg,
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long)]
+        shared_secret: Option<String>,
+        #[arg(long, default_value = ".syncer-local/device.json")]
+        device_config: Utf8PathBuf,
+    },
     ExecuteSyncQueue {
         #[arg(long)]
         path: Utf8PathBuf,
@@ -167,6 +190,36 @@ struct PendingTransferArg {
     queued_at: OffsetDateTime,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ResolveActionArg {
+    DownloadFromRemote,
+    UploadToRemote,
+}
+
+impl From<ResolveActionArg> for BlockedOperationResolution {
+    fn from(value: ResolveActionArg) -> Self {
+        match value {
+            ResolveActionArg::DownloadFromRemote => Self::DownloadFromRemote,
+            ResolveActionArg::UploadToRemote => Self::UploadToRemote,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DeleteScopeArg {
+    LocalOnly,
+    Both,
+}
+
+impl From<DeleteScopeArg> for DeleteScope {
+    fn from(value: DeleteScopeArg) -> Self {
+        match value {
+            DeleteScopeArg::LocalOnly => Self::LocalOnly,
+            DeleteScopeArg::Both => Self::PropagateToPeers,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum AgentError {
     #[error("{0}")]
@@ -175,6 +228,8 @@ enum AgentError {
     DateTime(#[from] time::error::Parse),
     #[error("file argument must use path:size_bytes:queued_at_rfc3339")]
     InvalidPendingTransfer,
+    #[error("endpoint and shared secret are required when delete scope is both")]
+    MissingDeletePeerConfig,
     #[error("failed to create parent directory {path}: {source}")]
     CreateDirectory {
         path: Utf8PathBuf,
@@ -265,6 +320,29 @@ async fn main() -> Result<(), AgentError> {
             path,
             remote_device_id,
         } => retry_failed(path, remote_device_id.as_deref()).await,
+        Command::ResolveBlocked {
+            path,
+            operation_id,
+            action,
+        } => resolve_blocked(path, &operation_id, action.into()).await,
+        Command::DeleteFile {
+            path,
+            file,
+            scope,
+            endpoint,
+            shared_secret,
+            device_config,
+        } => {
+            delete_file(
+                path,
+                &file,
+                scope.into(),
+                endpoint.as_deref(),
+                shared_secret.as_deref(),
+                &device_config,
+            )
+            .await
+        }
         Command::ExecuteSyncQueue {
             path,
             endpoint,
@@ -458,6 +536,97 @@ async fn retry_failed(path: Utf8PathBuf, remote_device_id: Option<&str>) -> Resu
     print_json(&summary)
 }
 
+async fn resolve_blocked(
+    path: Utf8PathBuf,
+    operation_id: &str,
+    resolution: BlockedOperationResolution,
+) -> Result<(), AgentError> {
+    let store = FolderStore::new(path);
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    let summary = database
+        .resolve_blocked_sync_operation(operation_id, resolution)
+        .await?;
+
+    print_json(&summary)
+}
+
+async fn delete_file(
+    path: Utf8PathBuf,
+    file: &str,
+    scope: DeleteScope,
+    endpoint: Option<&str>,
+    shared_secret: Option<&str>,
+    device_config: &Utf8PathBuf,
+) -> Result<(), AgentError> {
+    let relative_path = RelativePath::parse(file)?;
+    let store = FolderStore::new(path);
+    let database = StateDatabase::open(&store.state_db_path()).await?;
+    let existing = database
+        .list_files()
+        .await?
+        .into_iter()
+        .find(|record| record.path == relative_path)
+        .ok_or(TransferError::LocalFileMissing)?;
+    let target = store.root().join(relative_path.as_path());
+    if tokio::fs::try_exists(&target)
+        .await
+        .map_err(|source| TransferError::Filesystem {
+            path: target.clone(),
+            source,
+        })?
+    {
+        tokio::fs::remove_file(&target)
+            .await
+            .map_err(|source| TransferError::Filesystem {
+                path: target.clone(),
+                source,
+            })?;
+    }
+
+    match scope {
+        DeleteScope::LocalOnly => {
+            database.mark_file_deleted_locally(&relative_path).await?;
+            print_json(&DeleteFileOutput {
+                path: relative_path,
+                scope,
+                local_deleted: true,
+                remote_deleted: false,
+            })
+        }
+        DeleteScope::PropagateToPeers => {
+            let endpoint = endpoint.ok_or(AgentError::MissingDeletePeerConfig)?;
+            let shared_secret = shared_secret.ok_or(AgentError::MissingDeletePeerConfig)?;
+            let profile = LocalDeviceProfile::read(device_config)?;
+            let expected_hash = existing
+                .content_hash
+                .as_deref()
+                .ok_or(TransferError::LocalHashMissing)?;
+            let response = peer_client::delete_file(
+                endpoint,
+                &profile.device_id.to_string(),
+                shared_secret,
+                &relative_path,
+                expected_hash,
+                existing.size_bytes,
+            )?;
+            if !response.accepted
+                || response.path != relative_path
+                || response.size_bytes != existing.size_bytes
+                || response.content_hash != expected_hash
+            {
+                return Err(TransferError::UploadRejected.into());
+            }
+            database.forget_file(&relative_path).await?;
+            print_json(&DeleteFileOutput {
+                path: relative_path,
+                scope,
+                local_deleted: true,
+                remote_deleted: true,
+            })
+        }
+    }
+}
+
 async fn execute_sync_queue(
     path: Utf8PathBuf,
     endpoint: &str,
@@ -565,11 +734,9 @@ async fn upload_operation(
     remote_manifest: &FolderManifest,
     operation: &SyncOperationRecord,
 ) -> Result<TransferOperationResult, TransferError> {
-    if remote_manifest.files.iter().any(|file| {
+    let remote_target = remote_manifest.files.iter().find(|file| {
         file.path == operation.path && file.sync_state == syncer_core::FileSyncState::LocalAvailable
-    }) {
-        return Err(TransferError::RemoteTargetExists);
-    }
+    });
     let local_file = database
         .list_files()
         .await?
@@ -592,6 +759,31 @@ async fn upload_operation(
         .is_some_and(|size_bytes| size_bytes != local_file.size_bytes)
     {
         return Err(TransferError::LocalFileChanged);
+    }
+    if let Some(remote_target) = remote_target {
+        if operation.remote_content_hash.as_deref() != remote_target.content_hash.as_deref()
+            || operation.remote_size_bytes != Some(remote_target.size_bytes)
+        {
+            return Err(TransferError::RemoteTargetExists);
+        }
+        let response = peer_client::delete_file(
+            endpoint,
+            &profile.device_id.to_string(),
+            shared_secret,
+            &operation.path,
+            remote_target
+                .content_hash
+                .as_deref()
+                .ok_or(TransferError::RemoteHashMissing)?,
+            remote_target.size_bytes,
+        )?;
+        if !response.accepted
+            || response.path != operation.path
+            || response.size_bytes != remote_target.size_bytes
+            || Some(response.content_hash.as_str()) != remote_target.content_hash.as_deref()
+        {
+            return Err(TransferError::RemoteDeleteRejected);
+        }
     }
 
     let target = store.root().join(operation.path.as_path());
@@ -679,13 +871,20 @@ async fn download_operation(
     enforce_local_download_limit(store, database, &operation.path, remote_file.size_bytes).await?;
 
     let target = store.root().join(operation.path.as_path());
-    if tokio::fs::try_exists(&target)
-        .await
-        .map_err(|source| TransferError::Filesystem {
-            path: target.clone(),
-            source,
-        })?
-    {
+    let target_exists =
+        tokio::fs::try_exists(&target)
+            .await
+            .map_err(|source| TransferError::Filesystem {
+                path: target.clone(),
+                source,
+            })?;
+    let replace_existing = target_exists
+        && database.list_files().await?.into_iter().any(|file| {
+            file.path == operation.path
+                && operation.local_content_hash.as_deref() == file.content_hash.as_deref()
+                && operation.local_size_bytes == Some(file.size_bytes)
+        });
+    if target_exists && !replace_existing {
         return Err(TransferError::LocalTargetExists);
     }
 
@@ -708,6 +907,14 @@ async fn download_operation(
         return Err(TransferError::HashMismatch);
     }
 
+    if replace_existing {
+        tokio::fs::remove_file(&target)
+            .await
+            .map_err(|source| TransferError::Filesystem {
+                path: target.clone(),
+                source,
+            })?;
+    }
     publish_download(store, &operation.path, &temporary).await?;
     database
         .upsert_file(&FileEntry {
@@ -985,6 +1192,14 @@ struct QueueStatusOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct DeleteFileOutput {
+    path: RelativePath,
+    scope: DeleteScope,
+    local_deleted: bool,
+    remote_deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ExecuteSyncQueueOutput {
     completed: u64,
     failed: u64,
@@ -1020,6 +1235,8 @@ enum TransferError {
     RemoteFileChanged,
     #[error("remote target already exists")]
     RemoteTargetExists,
+    #[error("peer rejected remote delete")]
+    RemoteDeleteRejected,
     #[error("peer rejected uploaded file")]
     UploadRejected,
     #[error("local target already exists")]
