@@ -29,6 +29,7 @@ unimplemented = "deny"
 [workspace.dependencies]
 blake3 = "1.8.2"
 camino = { version = "1.2.1", features = ["serde1"] }
+chacha20poly1305 = "0.10.1"
 clap = { version = "4.5.53", features = ["derive", "env"] }
 hex = "0.4.3"
 hmac = "0.12.1"

@@ -13,6 +13,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
 use crate::path_codec::decode_relative_path;
+use crate::peer_crypto::{
+    ENCRYPTION_ALGORITHM, FileCipherContext, decrypt_file_to_path, encrypt_file_to_path,
+    encrypted_len,
+};
 use crate::peer_store::PeerStoreDocument;
 use crate::profile::LocalDeviceProfile;
 use crate::request_signing::verify_request_signature_with_body_hash_hex;
@@ -90,30 +94,34 @@ async fn route_request(
             json_response(200, &manifest)
         }
         ("GET", path) if path.starts_with("/file/") => {
-            verify_peer_request(request, &config.peers_path)?;
+            let shared_secret = verify_peer_request(request, &config.peers_path)?;
             let relative_path = decode_relative_path(path.trim_start_matches("/file/"))
                 .map_err(|_| PeerServerError::InvalidRequest)?;
             let shared_file =
                 shared_file(&config.folder_path, &config.profile, &relative_path).await?;
-            Ok(file_response(
-                200,
-                "application/octet-stream",
-                shared_file.path,
-                shared_file.size_bytes,
-            ))
+            encrypted_file_response(200, &shared_file, &relative_path, &shared_secret)
         }
         ("PUT", path) if path.starts_with("/file/") => {
-            verify_peer_request(request, &config.peers_path)?;
+            let shared_secret = verify_peer_request(request, &config.peers_path)?;
             let relative_path = decode_relative_path(path.trim_start_matches("/file/"))
                 .map_err(|_| PeerServerError::InvalidRequest)?;
             let expected_size = required_u64_header(request, "x-syncer-file-size")?;
             let expected_hash = required_header(request, "x-syncer-content-hash")?;
+            let encryption = required_header(request, "x-syncer-encryption")?;
+            if encryption != ENCRYPTION_ALGORITHM {
+                return Err(PeerServerError::InvalidRequest);
+            }
+            let nonce = required_header(request, "x-syncer-nonce")?;
             let response = write_uploaded_file(
                 &config.folder_path,
                 &config.profile,
                 &relative_path,
                 expected_size,
                 expected_hash,
+                UploadEncryption {
+                    shared_secret_hex: &shared_secret,
+                    nonce_hex: nonce,
+                },
                 request.file_body()?,
             )
             .await?;
@@ -165,6 +173,10 @@ async fn shared_file(
     Ok(SharedFile {
         path,
         size_bytes: file.size_bytes,
+        content_hash: file
+            .content_hash
+            .clone()
+            .ok_or(PeerServerError::InvalidRequest)?,
     })
 }
 
@@ -174,17 +186,38 @@ async fn write_uploaded_file(
     relative_path: &RelativePath,
     expected_size: u64,
     expected_hash: &str,
+    encryption: UploadEncryption<'_>,
     body: FileBody,
 ) -> Result<UploadFileResponse, PeerServerError> {
-    if body.size_bytes != expected_size {
+    if body.size_bytes != encrypted_len(expected_size) {
         return Err(PeerServerError::InvalidRequest);
     }
-    let content_hash = blake3_file_hex(&body.path).await?;
+    let store = FolderStore::new(folder_path.clone());
+    let plaintext_dir = store.syncer_dir().join("tmp").join("requests");
+    tokio::fs::create_dir_all(&plaintext_dir)
+        .await
+        .map_err(|source| PeerServerError::Filesystem {
+            path: plaintext_dir.clone(),
+            source,
+        })?;
+    let plaintext_path = plaintext_dir.join(format!("{}.plain", uuid::Uuid::now_v7()));
+    let decrypted = decrypt_file_to_path(
+        &body.path,
+        &plaintext_path,
+        encryption.shared_secret_hex,
+        encryption.nonce_hex,
+        &FileCipherContext {
+            direction: "upload",
+            path: relative_path,
+            content_hash: expected_hash,
+            plaintext_size: expected_size,
+        },
+    )?;
+    let content_hash = decrypted.content_hash;
     if content_hash != expected_hash {
         return Err(PeerServerError::HashMismatch);
     }
 
-    let store = FolderStore::new(folder_path.clone());
     enforce_folder_limit(&store, expected_size).await?;
     let target = folder_path.join(relative_path.as_path());
     if tokio::fs::try_exists(&target)
@@ -197,7 +230,7 @@ async fn write_uploaded_file(
         return Err(PeerServerError::Conflict);
     }
 
-    publish_uploaded_file(&store, relative_path, &body.path).await?;
+    publish_uploaded_file(&store, relative_path, &plaintext_path).await?;
     store.read().await?;
     let database = StateDatabase::open(&store.state_db_path()).await?;
     database
@@ -282,32 +315,6 @@ async fn enforce_folder_limit(
         });
     }
     Ok(())
-}
-
-async fn blake3_file_hex(path: &camino::Utf8Path) -> Result<String, PeerServerError> {
-    let mut file =
-        tokio::fs::File::open(path)
-            .await
-            .map_err(|source| PeerServerError::Filesystem {
-                path: path.to_owned(),
-                source,
-            })?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .await
-            .map_err(|source| PeerServerError::Filesystem {
-                path: path.to_owned(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 async fn publish_uploaded_file(
@@ -548,7 +555,7 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
 fn verify_peer_request(
     request: &HttpRequest,
     peers_path: &Utf8PathBuf,
-) -> Result<(), PeerServerError> {
+) -> Result<String, PeerServerError> {
     let device_id = request
         .headers
         .get("x-syncer-device-id")
@@ -583,7 +590,7 @@ fn verify_peer_request(
         &request.body_sha256_hex,
         &peer.shared_secret_hex,
     )?;
-    Ok(())
+    Ok(peer.shared_secret_hex.clone())
 }
 
 fn required_header<'request>(
@@ -612,24 +619,60 @@ fn json_response<T: Serialize>(status: u16, value: &T) -> Result<PeerResponse, P
     )))
 }
 
-fn file_response(
+fn encrypted_file_response(
     status: u16,
-    content_type: &'static str,
-    path: Utf8PathBuf,
-    size_bytes: u64,
-) -> PeerResponse {
-    let header = response_header(status, content_type, size_bytes);
-    PeerResponse::File { header, path }
+    shared_file: &SharedFile,
+    relative_path: &RelativePath,
+    shared_secret_hex: &str,
+) -> Result<PeerResponse, PeerServerError> {
+    let encrypted_path = shared_file
+        .path
+        .with_extension(format!("syncer-response-{}.enc", uuid::Uuid::now_v7()));
+    let encrypted = encrypt_file_to_path(
+        &shared_file.path,
+        &encrypted_path,
+        shared_secret_hex,
+        &FileCipherContext {
+            direction: "download",
+            path: relative_path,
+            content_hash: &shared_file.content_hash,
+            plaintext_size: shared_file.size_bytes,
+        },
+    )?;
+    let header = response_header(
+        status,
+        "application/octet-stream",
+        encrypted.size_bytes,
+        &[
+            ("x-syncer-encryption", ENCRYPTION_ALGORITHM),
+            ("x-syncer-nonce", encrypted.nonce_hex.as_str()),
+            ("x-syncer-content-hash", shared_file.content_hash.as_str()),
+            (
+                "x-syncer-plaintext-size",
+                &shared_file.size_bytes.to_string(),
+            ),
+        ],
+    );
+    Ok(PeerResponse::File {
+        header,
+        path: encrypted_path,
+        delete_after_send: true,
+    })
 }
 
 fn binary_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let header = response_header(status, content_type, body.len() as u64);
+    let header = response_header(status, content_type, body.len() as u64, &[]);
     let mut response = header.into_bytes();
     response.extend_from_slice(body);
     response
 }
 
-fn response_header(status: u16, content_type: &str, content_length: u64) -> String {
+fn response_header(
+    status: u16,
+    content_type: &str,
+    content_length: u64,
+    extra_headers: &[(&str, &str)],
+) -> String {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -639,9 +682,17 @@ fn response_header(status: u16, content_type: &str, content_length: u64) -> Stri
         413 => "Payload Too Large",
         _ => "Internal Server Error",
     };
-    format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {content_length}\r\nconnection: close\r\n\r\n"
-    )
+    let mut header = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {content_length}\r\n"
+    );
+    for (name, value) in extra_headers {
+        header.push_str(name);
+        header.push_str(": ");
+        header.push_str(value);
+        header.push_str("\r\n");
+    }
+    header.push_str("connection: close\r\n\r\n");
+    header
 }
 
 fn error_response(error: &PeerServerError) -> PeerResponse {
@@ -657,9 +708,10 @@ fn error_response(error: &PeerServerError) -> PeerResponse {
         | PeerServerError::HashMismatch
         | PeerServerError::FolderLimitExceeded { .. }
         | PeerServerError::Json(_) => 400,
-        PeerServerError::Io(_) | PeerServerError::Core(_) | PeerServerError::Filesystem { .. } => {
-            500
-        }
+        PeerServerError::Io(_)
+        | PeerServerError::Core(_)
+        | PeerServerError::Filesystem { .. }
+        | PeerServerError::PeerCrypto(_) => 500,
     };
     json_response(
         status,
@@ -682,7 +734,11 @@ async fn write_response(
 ) -> Result<(), PeerServerError> {
     match response {
         PeerResponse::Bytes(bytes) => stream.write_all(&bytes).await?,
-        PeerResponse::File { header, path } => {
+        PeerResponse::File {
+            header,
+            path,
+            delete_after_send,
+        } => {
             stream.write_all(header.as_bytes()).await?;
             let mut file = tokio::fs::File::open(&path).await.map_err(|source| {
                 PeerServerError::Filesystem {
@@ -703,6 +759,9 @@ async fn write_response(
                     break;
                 }
                 stream.write_all(&buffer[..read]).await?;
+            }
+            if delete_after_send {
+                tokio::fs::remove_file(&path).await.ok();
             }
         }
     }
@@ -762,13 +821,24 @@ struct FileBody {
 #[derive(Debug)]
 enum PeerResponse {
     Bytes(Vec<u8>),
-    File { header: String, path: Utf8PathBuf },
+    File {
+        header: String,
+        path: Utf8PathBuf,
+        delete_after_send: bool,
+    },
 }
 
 #[derive(Debug)]
 struct SharedFile {
     path: Utf8PathBuf,
     size_bytes: u64,
+    content_hash: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UploadEncryption<'request> {
+    shared_secret_hex: &'request str,
+    nonce_hex: &'request str,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -838,6 +908,8 @@ pub enum PeerServerError {
     PeerStore(#[from] crate::peer_store::PeerStoreError),
     #[error("{0}")]
     Signing(#[from] crate::request_signing::SigningError),
+    #[error("{0}")]
+    PeerCrypto(#[from] crate::peer_crypto::PeerCryptoError),
 }
 
 impl PeerServerError {
@@ -851,7 +923,9 @@ impl PeerServerError {
             Self::HashMismatch => "hash_mismatch",
             Self::FolderLimitExceeded { .. } => "folder_limit_exceeded",
             Self::Unauthorized | Self::PeerStore(_) | Self::Signing(_) => "unauthorized",
-            Self::Io(_) | Self::Core(_) | Self::Filesystem { .. } => "internal_error",
+            Self::Io(_) | Self::Core(_) | Self::Filesystem { .. } | Self::PeerCrypto(_) => {
+                "internal_error"
+            }
         }
         .to_owned()
     }
@@ -867,7 +941,12 @@ mod tests {
 
     use crate::profile::LocalDeviceProfile;
 
-    use super::{FileBody, PeerServerError, delete_shared_file, shared_file, write_uploaded_file};
+    use crate::peer_crypto::{FileCipherContext, encrypt_file_to_path, encrypted_len};
+
+    use super::{
+        FileBody, PeerServerError, UploadEncryption, delete_shared_file, shared_file,
+        write_uploaded_file,
+    };
 
     #[tokio::test]
     async fn reads_only_indexed_shared_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -930,18 +1009,48 @@ mod tests {
         let hash = ContentHash::from_bytes(body);
         let first_body_path = folder.syncer_dir().join("first-upload.body");
         let second_body_path = folder.syncer_dir().join("second-upload.body");
-        fs::write(&first_body_path, body)?;
-        fs::write(&second_body_path, body)?;
+        let first_plain_path = folder.syncer_dir().join("first-upload.plain");
+        let second_plain_path = folder.syncer_dir().join("second-upload.plain");
+        fs::write(&first_plain_path, body)?;
+        fs::write(&second_plain_path, body)?;
+        let secret = "1111111111111111111111111111111111111111111111111111111111111111";
+        let relative_path = RelativePath::parse("incoming/file.txt")?;
+        let first_encrypted = encrypt_file_to_path(
+            &first_plain_path,
+            &first_body_path,
+            secret,
+            &FileCipherContext {
+                direction: "upload",
+                path: &relative_path,
+                content_hash: hash.as_hex(),
+                plaintext_size: body.len() as u64,
+            },
+        )?;
+        let second_encrypted = encrypt_file_to_path(
+            &second_plain_path,
+            &second_body_path,
+            secret,
+            &FileCipherContext {
+                direction: "upload",
+                path: &relative_path,
+                content_hash: hash.as_hex(),
+                plaintext_size: body.len() as u64,
+            },
+        )?;
 
         let response = write_uploaded_file(
             &folder.root().to_owned(),
             &profile,
-            &RelativePath::parse("incoming/file.txt")?,
+            &relative_path,
             body.len() as u64,
             hash.as_hex(),
+            UploadEncryption {
+                shared_secret_hex: secret,
+                nonce_hex: &first_encrypted.nonce_hex,
+            },
             FileBody {
                 path: first_body_path,
-                size_bytes: body.len() as u64,
+                size_bytes: encrypted_len(body.len() as u64),
                 sha256_hex: String::new(),
             },
         )
@@ -949,12 +1058,16 @@ mod tests {
         let duplicate = write_uploaded_file(
             &folder.root().to_owned(),
             &profile,
-            &RelativePath::parse("incoming/file.txt")?,
+            &relative_path,
             body.len() as u64,
             hash.as_hex(),
+            UploadEncryption {
+                shared_secret_hex: secret,
+                nonce_hex: &second_encrypted.nonce_hex,
+            },
             FileBody {
                 path: second_body_path,
-                size_bytes: body.len() as u64,
+                size_bytes: encrypted_len(body.len() as u64),
                 sha256_hex: String::new(),
             },
         )

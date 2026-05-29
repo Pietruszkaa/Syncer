@@ -1,5 +1,6 @@
 mod path_codec;
 mod peer_client;
+mod peer_crypto;
 mod peer_server;
 mod peer_store;
 mod profile;

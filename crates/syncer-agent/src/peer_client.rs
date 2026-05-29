@@ -12,6 +12,10 @@ use syncer_core::{FolderManifest, PeerPresence, RelativePath};
 use time::OffsetDateTime;
 
 use crate::path_codec::encode_relative_path;
+use crate::peer_crypto::{
+    ENCRYPTION_ALGORITHM, FileCipherContext, decrypt_file_to_path, encrypt_file_to_path,
+    encrypted_len,
+};
 use crate::peer_server::PresenceResponse;
 use crate::request_signing::sign_request;
 
@@ -80,21 +84,50 @@ pub fn fetch_file_to_path(
     if head.status != 200 {
         return Err(PeerClientError::HttpStatus(head.status));
     }
-    if head.content_length != size_bytes {
+    let encryption = head
+        .headers
+        .get("x-syncer-encryption")
+        .ok_or(PeerClientError::InvalidResponse)?;
+    if encryption != ENCRYPTION_ALGORITHM {
+        return Err(PeerClientError::InvalidResponse);
+    }
+    let nonce = head
+        .headers
+        .get("x-syncer-nonce")
+        .ok_or(PeerClientError::InvalidResponse)?;
+    let content_hash = head
+        .headers
+        .get("x-syncer-content-hash")
+        .ok_or(PeerClientError::InvalidResponse)?;
+    let expected_ciphertext_size = encrypted_len(size_bytes);
+    if head.content_length != expected_ciphertext_size {
         return Err(PeerClientError::UnexpectedContentLength {
-            expected: size_bytes,
+            expected: expected_ciphertext_size,
             actual: head.content_length,
         });
     }
 
-    let mut output = File::create(destination)?;
-    let mut hasher = blake3::Hasher::new();
-    let written = copy_exact_with_blake3(&mut stream, &mut output, size_bytes, &mut hasher)?;
+    let encrypted = encrypted_download_path(destination);
+    let mut output = File::create(&encrypted)?;
+    copy_exact(&mut stream, &mut output, head.content_length)?;
     output.sync_all()?;
+    let decrypted = decrypt_file_to_path(
+        &encrypted,
+        destination,
+        shared_secret_hex,
+        nonce,
+        &FileCipherContext {
+            direction: "download",
+            path,
+            content_hash,
+            plaintext_size: size_bytes,
+        },
+    )?;
+    std::fs::remove_file(&encrypted).ok();
 
     Ok(TransferredFile {
-        size_bytes: written,
-        content_hash: hasher.finalize().to_hex().to_string(),
+        size_bytes: decrypted.size_bytes,
+        content_hash: decrypted.content_hash,
     })
 }
 
@@ -108,7 +141,23 @@ pub fn put_file_from_path(
     size_bytes: u64,
 ) -> Result<UploadFileResponse, PeerClientError> {
     let request_path = format!("/file/{}", encode_relative_path(path));
-    let body_sha256_hex = file_sha256_hex(file_path)?;
+    let encrypted = encrypted_upload_path(file_path);
+    let encrypted_file = encrypt_file_to_path(
+        file_path,
+        &encrypted,
+        shared_secret_hex,
+        &FileCipherContext {
+            direction: "upload",
+            path,
+            content_hash,
+            plaintext_size: size_bytes,
+        },
+    )?;
+    if encrypted_file.content_hash != content_hash {
+        std::fs::remove_file(&encrypted).ok();
+        return Err(PeerClientError::PlaintextHashMismatch);
+    }
+    let body_sha256_hex = file_sha256_hex(&encrypted)?;
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
     let signature = crate::request_signing::sign_request_with_body_hash_hex(
         "PUT",
@@ -120,16 +169,17 @@ pub fn put_file_from_path(
     )?;
     let address = PeerAddress::parse(endpoint)?;
     let request = format!(
-        "PUT {request_path} HTTP/1.1\r\nhost: {}\r\nx-syncer-device-id: {device_id}\r\nx-syncer-timestamp: {timestamp}\r\nx-syncer-signature: {signature}\r\ncontent-type: application/octet-stream\r\ncontent-length: {size_bytes}\r\nx-syncer-content-hash: {content_hash}\r\nx-syncer-file-size: {size_bytes}\r\nconnection: close\r\n\r\n",
-        address.host
+        "PUT {request_path} HTTP/1.1\r\nhost: {}\r\nx-syncer-device-id: {device_id}\r\nx-syncer-timestamp: {timestamp}\r\nx-syncer-signature: {signature}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nx-syncer-content-hash: {content_hash}\r\nx-syncer-file-size: {size_bytes}\r\nx-syncer-encryption: {ENCRYPTION_ALGORITHM}\r\nx-syncer-nonce: {}\r\nconnection: close\r\n\r\n",
+        address.host, encrypted_file.size_bytes, encrypted_file.nonce_hex
     );
     let mut stream = TcpStream::connect((&address.host[..], address.port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(request.as_bytes())?;
-    let mut file = File::open(file_path)?;
+    let mut file = File::open(&encrypted)?;
     std::io::copy(&mut file, &mut stream)?;
     stream.flush()?;
+    std::fs::remove_file(&encrypted).ok();
 
     let mut response = Vec::new();
     stream
@@ -329,6 +379,7 @@ fn read_response_head(reader: &mut impl Read) -> Result<ResponseHead, PeerClient
     Ok(ResponseHead {
         status,
         content_length,
+        headers,
     })
 }
 
@@ -341,11 +392,10 @@ fn parse_headers(header: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn copy_exact_with_blake3(
+fn copy_exact(
     reader: &mut impl Read,
     writer: &mut impl Write,
     expected: u64,
-    hasher: &mut blake3::Hasher,
 ) -> Result<u64, PeerClientError> {
     let mut remaining = expected;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -357,10 +407,17 @@ fn copy_exact_with_blake3(
             return Err(PeerClientError::InvalidResponse);
         }
         writer.write_all(&buffer[..read])?;
-        hasher.update(&buffer[..read]);
         remaining = remaining.saturating_sub(read as u64);
     }
     Ok(expected)
+}
+
+fn encrypted_upload_path(path: &Utf8Path) -> camino::Utf8PathBuf {
+    path.with_extension(format!("syncer-upload-{}.enc", uuid::Uuid::now_v7()))
+}
+
+fn encrypted_download_path(path: &Utf8Path) -> camino::Utf8PathBuf {
+    path.with_extension(format!("syncer-download-{}.enc", uuid::Uuid::now_v7()))
 }
 
 fn file_sha256_hex(path: &Utf8Path) -> Result<String, PeerClientError> {
@@ -381,6 +438,7 @@ fn file_sha256_hex(path: &Utf8Path) -> Result<String, PeerClientError> {
 struct ResponseHead {
     status: u16,
     content_length: u64,
+    headers: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -425,6 +483,10 @@ pub enum PeerClientError {
     HttpStatus(u16),
     #[error("unexpected content length: expected {expected}, got {actual}")]
     UnexpectedContentLength { expected: u64, actual: u64 },
+    #[error("plaintext hash does not match the queued content hash")]
+    PlaintextHashMismatch,
+    #[error("{0}")]
+    PeerCrypto(#[from] crate::peer_crypto::PeerCryptoError),
     #[error("{0}")]
     Signing(#[from] crate::request_signing::SigningError),
 }
