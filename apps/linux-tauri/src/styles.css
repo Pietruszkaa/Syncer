@@ -20,6 +20,18 @@ button {
   font: inherit;
 }
 
+input,
+select {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid #cbd3dc;
+  border-radius: 8px;
+  padding: 0 10px;
+  background: #ffffff;
+  color: #1d252d;
+  font: inherit;
+}
+
 .shell {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
@@ -116,11 +128,54 @@ button {
   font-weight: 700;
 }
 
+.primary-button.inline {
+  margin-top: 0;
+  padding: 0 14px;
+}
+
 .workspace {
   display: grid;
   grid-template-rows: auto auto minmax(240px, 1fr) auto;
   gap: 16px;
   padding: 20px;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.onboarding {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid #bfd8c8;
+  border-radius: 8px;
+  background: #f4fbf7;
+}
+
+.folder-form {
+  display: grid;
+  gap: 14px;
+}
+
+.folder-form label {
+  display: grid;
+  gap: 6px;
+  color: #3e4a56;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) minmax(180px, 1fr);
+  gap: 12px;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .topbar,
@@ -267,12 +322,21 @@ button {
     min-height: auto;
   }
 
+  .form-row,
   .status-grid,
   .settings-grid {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
   }
 
   .operation-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  .form-row,
+  .status-grid,
+  .settings-grid {
     grid-template-columns: 1fr;
   }
 }

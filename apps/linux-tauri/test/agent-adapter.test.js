@@ -11,6 +11,13 @@ test("uses Tauri command names for agent actions", async () => {
   });
 
   await adapter.loadSnapshot();
+  await adapter.addFolder({
+    displayName: "Docs",
+    path: "/tmp/docs",
+    mode: "bidirectional",
+    intervalSeconds: 300,
+    maxBytes: 1024
+  });
   await adapter.syncOnce("folder-1");
   await adapter.retryFailed("folder-1");
   await adapter.resolveBlocked("op-1", "download_from_remote");
@@ -18,6 +25,18 @@ test("uses Tauri command names for agent actions", async () => {
 
   assert.deepEqual(calls, [
     { command: "syncer_load_snapshot", payload: undefined },
+    {
+      command: "syncer_add_folder",
+      payload: {
+        folder: {
+          displayName: "Docs",
+          path: "/tmp/docs",
+          mode: "bidirectional",
+          intervalSeconds: 300,
+          maxBytes: 1024
+        }
+      }
+    },
     { command: "syncer_sync_once", payload: { folderId: "folder-1" } },
     { command: "syncer_retry_failed", payload: { folderId: "folder-1" } },
     {
@@ -35,7 +54,15 @@ test("falls back to local sample data outside Tauri", async () => {
   const adapter = createAgentAdapter(null);
   const snapshot = await adapter.loadSnapshot();
   const synced = await adapter.syncOnce("documents");
+  const added = await adapter.addFolder({
+    displayName: "New",
+    path: "/tmp/new",
+    mode: "bidirectional",
+    intervalSeconds: 300,
+    maxBytes: 1024
+  });
 
   assert.equal(snapshot.selectedFolderId, "documents");
   assert.equal(synced.queue.pending, 0);
+  assert.equal(added.selectedFolderId, "new-folder");
 });

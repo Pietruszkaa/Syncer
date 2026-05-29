@@ -5,6 +5,19 @@ import { buildDashboardViewModel } from "./view-model.js";
 const adapter = createAgentAdapter();
 let currentModel = null;
 
+document.getElementById("add-folder").addEventListener("click", () => {
+  showOnboarding(true);
+});
+
+document.getElementById("cancel-folder").addEventListener("click", () => {
+  showOnboarding(false);
+});
+
+document.getElementById("folder-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  void addFolder(new FormData(event.currentTarget));
+});
+
 document.getElementById("sync-now").addEventListener("click", () => {
   void runSync();
 });
@@ -17,6 +30,7 @@ async function refresh() {
     const snapshot = await adapter.loadSnapshot();
     currentModel = buildDashboardViewModel(snapshot);
     render(currentModel);
+    showOnboarding(currentModel.folders.length === 0);
   } catch (error) {
     renderError(error);
   } finally {
@@ -34,6 +48,27 @@ async function runSync() {
     const snapshot = await adapter.syncOnce(currentModel.selectedFolder.id);
     currentModel = buildDashboardViewModel(snapshot);
     render(currentModel);
+  } catch (error) {
+    renderError(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function addFolder(formData) {
+  setBusy(true);
+  try {
+    const snapshot = await adapter.addFolder({
+      displayName: String(formData.get("displayName") ?? "").trim(),
+      path: String(formData.get("path") ?? "").trim(),
+      mode: String(formData.get("mode") ?? "bidirectional"),
+      intervalSeconds: Number(formData.get("intervalSeconds") ?? 300),
+      maxBytes: Number(formData.get("maxBytes") ?? 10_737_418_240)
+    });
+    document.getElementById("folder-form").reset();
+    currentModel = buildDashboardViewModel(snapshot);
+    render(currentModel);
+    showOnboarding(false);
   } catch (error) {
     renderError(error);
   } finally {
@@ -94,6 +129,11 @@ function setBusy(busy) {
   const syncButton = document.getElementById("sync-now");
   syncButton.disabled = busy;
   syncButton.classList.toggle("busy", busy);
+  document.querySelector("#folder-form button[type='submit']").disabled = busy;
+}
+
+function showOnboarding(visible) {
+  document.getElementById("onboarding").classList.toggle("hidden", !visible);
 }
 
 function renderSummary(model) {

@@ -91,6 +91,40 @@ pub fn queue_status(runtime: &AgentRuntime, folder: &FolderConnection) -> AgentC
     )
 }
 
+pub fn init_folder(
+    runtime: &AgentRuntime,
+    folder: &FolderConnection,
+    display_name: &str,
+    max_bytes: u64,
+    warning_threshold_percent: u8,
+) -> AgentCommand {
+    AgentCommand::new(
+        runtime.binary.clone(),
+        vec![
+            os("init-folder"),
+            os("--path"),
+            folder.path.clone().into_os_string(),
+            os("--display-name"),
+            os(display_name),
+            os("--max-bytes"),
+            os(max_bytes.to_string()),
+            os("--warning-threshold-percent"),
+            os(warning_threshold_percent.to_string()),
+        ],
+    )
+}
+
+pub fn folder_status(runtime: &AgentRuntime, folder: &FolderConnection) -> AgentCommand {
+    AgentCommand::new(
+        runtime.binary.clone(),
+        vec![
+            os("folder-status"),
+            os("--path"),
+            folder.path.clone().into_os_string(),
+        ],
+    )
+}
+
 pub fn retry_failed(runtime: &AgentRuntime, folder: &FolderConnection) -> AgentCommand {
     AgentCommand::new(
         runtime.binary.clone(),
@@ -222,6 +256,26 @@ mod tests {
                 os("25"),
                 os("--device-config"),
                 os("/tmp/device.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_init_folder_command() {
+        let command = init_folder(&runtime(), &folder(), "Docs", 1024, 80);
+
+        assert_eq!(
+            command.args,
+            vec![
+                os("init-folder"),
+                os("--path"),
+                os("/tmp/folder"),
+                os("--display-name"),
+                os("Docs"),
+                os("--max-bytes"),
+                os("1024"),
+                os("--warning-threshold-percent"),
+                os("80"),
             ]
         );
     }

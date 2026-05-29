@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.syncer.linux",
   "build": {
-    "beforeDevCommand": "python3 -m http.server 1430 --bind 127.0.0.1 --directory ../src",
+    "beforeDevCommand": "python3 -m http.server 1430 --bind 127.0.0.1 --directory src",
     "beforeBuildCommand": "",
     "frontendDist": "../src",
     "devUrl": "http://localhost:1430"

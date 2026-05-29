@@ -9,6 +9,35 @@ export function createAgentAdapter(invoker = defaultInvoker()) {
       return invoker("syncer_load_snapshot");
     },
 
+    async addFolder(folder) {
+      if (!invoker) {
+        return {
+          ...sampleSnapshot,
+          selectedFolderId: "new-folder",
+          folders: [
+            ...sampleSnapshot.folders,
+            {
+              config: {
+                id: "new-folder",
+                display_name: folder.displayName,
+                path: folder.path,
+                mode: folder.mode,
+                interval_seconds: folder.intervalSeconds,
+                max_bytes: folder.maxBytes
+              },
+              status: {
+                indexed_files: 0,
+                indexed_bytes: 0,
+                skipped_folder_limit: 0,
+                unsynchronized_local_missing: 0
+              }
+            }
+          ]
+        };
+      }
+      return invoker("syncer_add_folder", { folder });
+    },
+
     async syncOnce(folderId) {
       if (!invoker) {
         return {

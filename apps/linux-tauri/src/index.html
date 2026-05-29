@@ -21,6 +21,45 @@
       </aside>
 
       <section class="workspace" aria-live="polite">
+        <section id="onboarding" class="onboarding hidden" aria-label="Add first folder">
+          <div>
+            <p class="eyebrow">First folder</p>
+            <h2>Add a folder to sync</h2>
+          </div>
+          <form id="folder-form" class="folder-form">
+            <label>
+              <span>Display name</span>
+              <input id="folder-name-input" name="displayName" autocomplete="off" required>
+            </label>
+            <label>
+              <span>Folder path</span>
+              <input id="folder-path-input" name="path" autocomplete="off" placeholder="/home/user/Documents" required>
+            </label>
+            <div class="form-row">
+              <label>
+                <span>Mode</span>
+                <select id="folder-mode-input" name="mode">
+                  <option value="bidirectional">Two-way</option>
+                  <option value="upload_only">Upload only</option>
+                  <option value="download_only">Download only</option>
+                </select>
+              </label>
+              <label>
+                <span>Sync interval</span>
+                <input id="folder-interval-input" name="intervalSeconds" type="number" min="30" step="30" value="300" required>
+              </label>
+              <label>
+                <span>Folder limit</span>
+                <input id="folder-limit-input" name="maxBytes" type="number" min="1048576" step="1048576" value="10737418240" required>
+              </label>
+            </div>
+            <div class="form-actions">
+              <button id="cancel-folder" class="segment" type="button">Cancel</button>
+              <button class="primary-button inline" type="submit">Create folder</button>
+            </div>
+          </form>
+        </section>
+
         <header class="topbar">
           <div>
             <p id="peer-state" class="eyebrow">Peer online</p>
