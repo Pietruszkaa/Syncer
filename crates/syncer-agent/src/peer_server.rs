@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use syncer_core::{
     ContentHash, FileEntry, FileKind, FileSyncState, FileVersion, FolderManifest, FolderStore,
-    PeerPresence, RelativePath, StateDatabase,
+    LinuxFolderScanner, PeerPresence, RelativePath, StateDatabase,
 };
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -346,6 +346,8 @@ async fn export_manifest(
     let store = FolderStore::new(folder_path.clone());
     let folder = store.read().await?;
     let database = StateDatabase::open(&store.state_db_path()).await?;
+    let scanner = LinuxFolderScanner::new(folder_path.clone(), profile.device_id);
+    scanner.scan_into(&database).await?;
     database
         .export_manifest(folder.folder.id, profile.device_id)
         .await

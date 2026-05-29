@@ -172,6 +172,32 @@ enum Command {
         #[arg(long, default_value = ".syncer-local/device.json")]
         device_config: Utf8PathBuf,
     },
+    SyncOnce {
+        #[arg(long)]
+        path: Utf8PathBuf,
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        shared_secret: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        #[arg(long, default_value = ".syncer-local/device.json")]
+        device_config: Utf8PathBuf,
+    },
+    SyncLoop {
+        #[arg(long)]
+        path: Utf8PathBuf,
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        shared_secret: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        #[arg(long)]
+        iterations: Option<u64>,
+        #[arg(long, default_value = ".syncer-local/device.json")]
+        device_config: Utf8PathBuf,
+    },
     PlanFolderLimit {
         #[arg(long)]
         max_bytes: u64,
@@ -261,6 +287,7 @@ enum AgentError {
 }
 
 #[tokio::main]
+#[expect(clippy::too_many_lines, reason = "explicit CLI command dispatch")]
 async fn main() -> Result<(), AgentError> {
     let cli = Cli::parse();
 
@@ -351,6 +378,31 @@ async fn main() -> Result<(), AgentError> {
             limit,
             device_config,
         } => execute_sync_queue(path, &endpoint, &shared_secret, limit, &device_config).await,
+        Command::SyncOnce {
+            path,
+            endpoint,
+            shared_secret,
+            limit,
+            device_config,
+        } => sync_once(path, &endpoint, &shared_secret, limit, &device_config).await,
+        Command::SyncLoop {
+            path,
+            endpoint,
+            shared_secret,
+            limit,
+            iterations,
+            device_config,
+        } => {
+            sync_loop(
+                path,
+                &endpoint,
+                &shared_secret,
+                limit,
+                iterations,
+                &device_config,
+            )
+            .await
+        }
         Command::PlanFolderLimit {
             max_bytes,
             warning_threshold_percent,
@@ -465,8 +517,18 @@ fn ping_peer(
     shared_secret: &str,
     device_config: &Utf8PathBuf,
 ) -> Result<(), AgentError> {
+    let response = send_presence(endpoint, shared_secret, device_config)?;
+
+    print_json(&response)
+}
+
+fn send_presence(
+    endpoint: &str,
+    shared_secret: &str,
+    device_config: &Utf8PathBuf,
+) -> Result<peer_server::PresenceResponse, AgentError> {
     let profile = LocalDeviceProfile::read(device_config)?;
-    let response = peer_client::post_presence(
+    Ok(peer_client::post_presence(
         endpoint,
         &profile.device_id.to_string(),
         shared_secret,
@@ -475,9 +537,7 @@ fn ping_peer(
             sent_at: OffsetDateTime::now_utc(),
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         },
-    )?;
-
-    print_json(&response)
+    )?)
 }
 
 fn fetch_manifest(
@@ -635,6 +695,80 @@ async fn execute_sync_queue(
     limit: u64,
     device_config: &Utf8PathBuf,
 ) -> Result<(), AgentError> {
+    let output = run_sync_queue(path, endpoint, shared_secret, limit, device_config).await?;
+
+    print_json(&output)
+}
+
+async fn sync_once(
+    path: Utf8PathBuf,
+    endpoint: &str,
+    shared_secret: &str,
+    limit: u64,
+    device_config: &Utf8PathBuf,
+) -> Result<(), AgentError> {
+    let output = run_sync_once(path, endpoint, shared_secret, limit, device_config).await?;
+
+    print_json(&output)
+}
+
+async fn sync_loop(
+    path: Utf8PathBuf,
+    endpoint: &str,
+    shared_secret: &str,
+    limit: u64,
+    iterations: Option<u64>,
+    device_config: &Utf8PathBuf,
+) -> Result<(), AgentError> {
+    let mut completed_iterations = 0_u64;
+    loop {
+        let output =
+            run_sync_once(path.clone(), endpoint, shared_secret, limit, device_config).await?;
+        print_json(&output)?;
+        completed_iterations = completed_iterations.saturating_add(1);
+        if iterations.is_some_and(|max| completed_iterations >= max) {
+            return Ok(());
+        }
+
+        let store = FolderStore::new(path.clone());
+        let interval = store.read().await?.folder.sync_interval();
+        let seconds = u64::try_from(interval.whole_seconds())
+            .unwrap_or_default()
+            .max(1);
+        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+    }
+}
+
+async fn run_sync_once(
+    path: Utf8PathBuf,
+    endpoint: &str,
+    shared_secret: &str,
+    limit: u64,
+    device_config: &Utf8PathBuf,
+) -> Result<SyncOnceOutput, AgentError> {
+    let presence = send_presence(endpoint, shared_secret, device_config)?;
+    let (plan, database) =
+        build_sync_plan(path.clone(), endpoint, shared_secret, device_config).await?;
+    let queued = database.enqueue_sync_plan(&plan).await?;
+    let transfer = run_sync_queue(path, endpoint, shared_secret, limit, device_config).await?;
+    let final_queue = database.queue_status().await?;
+
+    Ok(SyncOnceOutput {
+        presence,
+        plan_summary: plan.summary,
+        queued,
+        transfer,
+        final_queue,
+    })
+}
+
+async fn run_sync_queue(
+    path: Utf8PathBuf,
+    endpoint: &str,
+    shared_secret: &str,
+    limit: u64,
+    device_config: &Utf8PathBuf,
+) -> Result<ExecuteSyncQueueOutput, AgentError> {
     let profile = LocalDeviceProfile::read(device_config)?;
     let store = FolderStore::new(path.clone());
     let database = StateDatabase::open(&store.state_db_path()).await?;
@@ -719,7 +853,7 @@ async fn execute_sync_queue(
         }
     }
 
-    print_json(&ExecuteSyncQueueOutput {
+    Ok(ExecuteSyncQueueOutput {
         completed,
         failed,
         results,
@@ -1205,6 +1339,15 @@ struct ExecuteSyncQueueOutput {
     completed: u64,
     failed: u64,
     results: Vec<TransferOperationResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncOnceOutput {
+    presence: peer_server::PresenceResponse,
+    plan_summary: syncer_core::SyncPlanSummary,
+    queued: syncer_core::QueueStatus,
+    transfer: ExecuteSyncQueueOutput,
+    final_queue: syncer_core::QueueStatus,
 }
 
 #[derive(Debug, Serialize)]
